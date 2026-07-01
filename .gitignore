@@ -4,3 +4,8 @@
 .env
 
 __pycache__
+
+*.csv
+*.xlsx
+
+Dataset/
