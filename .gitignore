@@ -9,3 +9,5 @@ __pycache__
 *.xlsx
 
 Dataset/
+
+ignore.txt
