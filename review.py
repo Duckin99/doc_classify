@@ -6,9 +6,9 @@ Run locally with:
     streamlit run review_app.py
 
 Expects a CSV with (at minimum) these columns:
-    filepath, triage_decision, triage_reason, triage_confidence,
+    filepath, macro_decision, macro_reason, macro_confidence,
     final_subcategory, specialist_reason, specialist_confidence,
-    ground_truth, triage_gt
+    ground_truth, macro_gt
 
 If an `ocr_text` column is missing, a clearly-labeled placeholder is
 generated automatically so the UI works today -- once you wire up the real
@@ -23,9 +23,9 @@ from pathlib import Path
 st.set_page_config(page_title="Doc Classification Review", layout="wide")
 
 REQUIRED_COLS = [
-    "filepath", "triage_decision", "triage_reason", "triage_confidence",
+    "filepath", "macro_decision", "macro_reason", "macro_confidence",
     "final_subcategory", "specialist_reason", "specialist_confidence",
-    "ground_truth", "triage_gt",
+    "ground_truth", "macro_gt",
 ]
 
 
@@ -132,7 +132,7 @@ def render_matrix_tab(df: pd.DataFrame, true_col: str, pred_col: str,
 
 def main():
     st.title("📄 Document Classification Review Dashboard")
-    st.caption("Triage & specialist confusion matrices with per-sample drill-down (OCR text, image, reasoning, confidence).")
+    st.caption("Macro & specialist confusion matrices with per-sample drill-down (OCR text, image, reasoning, confidence).")
 
     st.sidebar.header("Data")
     uploaded = st.sidebar.file_uploader("Upload results CSV", type=["csv"])
@@ -155,13 +155,13 @@ def main():
 
     st.sidebar.metric("Total rows", len(df))
 
-    tab1, tab2 = st.tabs(["🗂️ Main Class (Triage)", "🔍 Subclass (Specialist)"])
+    tab1, tab2 = st.tabs(["🗂️ Main Class (Macro)", "🔍 Subclass (Specialist)"])
 
     with tab1:
         render_matrix_tab(
-            df, true_col="triage_gt", pred_col="triage_decision",
-            reason_cols=["triage_reason"], conf_cols=["triage_confidence"],
-            title="Triage: triage_gt vs triage_decision",
+            df, true_col="macro_gt", pred_col="macro_decision",
+            reason_cols=["macro_reason"], conf_cols=["macro_confidence"],
+            title="Macro: macro_gt vs macro_decision",
             key_prefix="main",
         )
 
