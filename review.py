@@ -1,9 +1,9 @@
 """
-Document Classification Review Dashboard (v3 -- adds file-move / dataset-cleaning tool)
+Document Classification Review Dashboard (v2 -- three-stage architecture)
 ==========================================================================
 Run locally with:
     pip install streamlit pandas plotly
-    streamlit run review_app_v3.py
+    streamlit run review_app_v2.py
 
 Expects a results CSV (matching cascade_pipeline_v11.py's evaluate_experiment output)
 with at least:
@@ -21,23 +21,14 @@ Optional ground-truth columns, auto-handled if missing/stale:
         medical_* -> not applicable).
 
 If ocr_text is missing, a clearly-labeled placeholder is generated automatically.
-
-NEW in v3: each sample card has a "Move file" control. Pick a known class (or type a
-custom relative path), and it moves the file on disk to <base_dir>/<relative_path>/,
-creating the destination folder if needed. Base dir defaults to "./Dataset" and is
-editable in the sidebar. Every move is appended to move_log.csv for an audit trail.
 """
 
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import os
-import shutil
-import csv
-from datetime import datetime
 from pathlib import Path
 
-st.set_page_config(page_title="Doc Classification Review v3", layout="wide")
+st.set_page_config(page_title="Doc Classification Review v2", layout="wide")
 
 REQUIRED_BASE_COLS = [
     "triage_decision", "triage_reason", "triage_confidence",
@@ -45,67 +36,6 @@ REQUIRED_BASE_COLS = [
     "final_subcategory", "specialist_reason", "specialist_confidence",
     "ground_truth",
 ]
-
-# Full known leaf taxonomy from cascade_pipeline_v11.py, used to populate the "move to"
-# quick-pick dropdown so you're choosing from valid class names instead of free-typing
-# a path (and risking a typo silently creating a stray new folder).
-ALL_KNOWN_CLASSES = sorted([
-    "medical_clinical", "medical_healthcheck", "medical_lab", "medical_others",
-    "financial_bankstatement", "financial_bookbank", "financial_companyregistration",
-    "financial_receipt", "financial_selfincomedeclaration", "financial_others",
-    "id_driverlicense", "id_fatca_w9", "id_foreignerconfirmationform",
-    "id_foreigner_nationalid", "id_visastamp", "id_passport", "id_statelessid",
-    "id_thainationalid", "id_workpermit", "id_houseregistration",
-    "id_marriagecertificate", "id_others",
-    "eform", "unrelated_document",
-])
-
-MOVE_LOG_FILENAME = "move_log.csv"
-
-
-def perform_move(source_path: str, base_dir: str, relative_dest: str, overwrite: bool):
-    """Moves source_path into <base_dir>/<relative_dest>/, creating the destination
-    folder if it doesn't exist. Returns (success: bool, message: str)."""
-    source_path = str(source_path)
-    if not os.path.isfile(source_path):
-        return False, f"Source file not found on disk: `{source_path}`"
-
-    relative_dest = relative_dest.strip().strip("/\\")
-    if not relative_dest:
-        return False, "Destination folder can't be empty."
-
-    dest_dir = os.path.join(base_dir, relative_dest)
-    try:
-        os.makedirs(dest_dir, exist_ok=True)
-    except Exception as e:
-        return False, f"Could not create destination folder `{dest_dir}`: {e}"
-
-    filename = os.path.basename(source_path)
-    dest_path = os.path.join(dest_dir, filename)
-
-    if os.path.exists(dest_path) and not overwrite:
-        return False, f"A file already exists at `{dest_path}`. Check 'Overwrite' to replace it."
-
-    try:
-        shutil.move(source_path, dest_path)
-    except Exception as e:
-        return False, f"Move failed: {e}"
-
-    log_row = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "filename": filename,
-        "source_path": source_path,
-        "dest_path": dest_path,
-    }
-    log_exists = os.path.isfile(MOVE_LOG_FILENAME)
-    with open(MOVE_LOG_FILENAME, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(log_row.keys()))
-        if not log_exists:
-            writer.writeheader()
-        writer.writerow(log_row)
-
-    return True, dest_path
-
 
 OLD_TRIAGE_GT_MAP = {
     "medical": "medical",
@@ -192,23 +122,18 @@ def build_confusion(df: pd.DataFrame, true_col: str, pred_col: str):
     return cm, labels
 
 
-def render_sample(row, true_col, pred_col, reason_cols, conf_cols, key_prefix, idx, base_dir):
-    fp = row.get("filepath", row.get("filename", ""))
-    already_moved = st.session_state.get("moved_files", {}).get(str(fp))
-
-    header = f"{Path(str(fp)).name}  —  GT: {row[true_col]}  →  Pred: {row[pred_col]}"
-    if already_moved:
-        header += "  ✅ moved"
+def render_sample(row, true_col, pred_col, reason_cols, conf_cols, key_prefix, idx):
+    header = f"{Path(str(row.get('filepath', row.get('filename', '')))).name}  —  GT: {row[true_col]}  →  Pred: {row[pred_col]}"
     with st.expander(header):
         img_col, text_col = st.columns([1, 1])
 
         with img_col:
             st.markdown("**Document image**")
-            display_path = already_moved or fp
+            fp = row.get("filepath", row.get("filename", ""))
             try:
-                st.image(display_path, use_container_width=True)
+                st.image(fp, use_container_width=True)
             except Exception:
-                st.info(f"Could not load image from path:\n`{display_path}`")
+                st.info(f"Could not load image from path:\n`{fp}`")
 
         with text_col:
             st.markdown("**OCR text**")
@@ -227,56 +152,10 @@ def render_sample(row, true_col, pred_col, reason_cols, conf_cols, key_prefix, i
         if conf_bits:
             st.caption(" | ".join(conf_bits))
 
-        st.markdown("---")
-        st.markdown("**📦 Move to correct folder**")
-
-        if already_moved:
-            st.success(f"Already moved this session to:\n`{already_moved}`")
-        else:
-            mv_col1, mv_col2, mv_col3 = st.columns([1.2, 1.5, 0.8])
-
-            with mv_col1:
-                pick_options = ["(custom path)"] + ALL_KNOWN_CLASSES
-                default_pick = row[true_col] if row[true_col] in ALL_KNOWN_CLASSES else "(custom path)"
-                picked = st.selectbox(
-                    "Target class", pick_options,
-                    index=pick_options.index(default_pick),
-                    key=f"{key_prefix}_pick_{idx}",
-                )
-
-            with mv_col2:
-                if picked == "(custom path)":
-                    relative_dest = st.text_input(
-                        "Relative path under base dir", value=str(row.get(true_col, "")),
-                        key=f"{key_prefix}_custom_{idx}",
-                    )
-                else:
-                    relative_dest = picked
-                    st.text_input(
-                        "Relative path under base dir", value=relative_dest,
-                        key=f"{key_prefix}_lockedpath_{idx}", disabled=True,
-                    )
-
-            with mv_col3:
-                overwrite = st.checkbox("Overwrite", value=False, key=f"{key_prefix}_ow_{idx}")
-
-            dest_preview = os.path.join(base_dir, relative_dest.strip().strip("/\\"), Path(str(fp)).name) if relative_dest else ""
-            if dest_preview:
-                st.caption(f"Will move to: `{dest_preview}`")
-
-            if st.button("Move file here", key=f"{key_prefix}_movebtn_{idx}", disabled=not relative_dest):
-                success, message = perform_move(fp, base_dir, relative_dest, overwrite)
-                if success:
-                    st.session_state.setdefault("moved_files", {})[str(fp)] = message
-                    st.success(f"Moved to `{message}`")
-                    st.rerun()
-                else:
-                    st.error(message)
-
 
 def render_matrix_tab(df: pd.DataFrame, true_col: str, pred_col: str,
                        reason_cols: list, conf_cols: list, title: str, key_prefix: str,
-                       base_dir: str, scope_note: str = ""):
+                       scope_note: str = ""):
     st.subheader(title)
     if scope_note:
         st.caption(scope_note)
@@ -327,12 +206,12 @@ def render_matrix_tab(df: pd.DataFrame, true_col: str, pred_col: str,
         if i >= max_show:
             st.info(f"Showing first {max_show} of {len(filtered)} -- narrow your filter to see more precisely.")
             break
-        render_sample(row, true_col, pred_col, reason_cols, conf_cols, key_prefix, idx, base_dir)
+        render_sample(row, true_col, pred_col, reason_cols, conf_cols, key_prefix, idx)
 
 
 def main():
-    st.title("📄 Document Classification Review Dashboard (v3)")
-    st.caption("Triage → Router → Specialist confusion matrices with per-sample drill-down (OCR text, image, reasoning, confidence, and dataset-cleaning file moves).")
+    st.title("📄 Document Classification Review Dashboard (v2)")
+    st.caption("Triage → Router → Specialist confusion matrices with per-sample drill-down (OCR text, image, reasoning, confidence).")
 
     st.sidebar.header("Data")
     uploaded = st.sidebar.file_uploader("Upload results CSV", type=["csv"])
@@ -357,20 +236,6 @@ def main():
 
     st.sidebar.metric("Total rows", len(df))
 
-    st.sidebar.header("Dataset Cleaning")
-    base_dir = st.sidebar.text_input(
-        "Base folder for moved files", value="./Dataset",
-        help="Moving a file joins this base path with whatever relative path/class you pick on that sample's card. Created automatically if it doesn't exist.",
-    )
-    if os.path.isfile(MOVE_LOG_FILENAME):
-        with st.sidebar.expander(f"📜 Move log ({sum(1 for _ in open(MOVE_LOG_FILENAME)) - 1} move(s))"):
-            log_df = pd.read_csv(MOVE_LOG_FILENAME)
-            st.dataframe(log_df, use_container_width=True, height=200)
-            st.download_button(
-                "Download move_log.csv", data=log_df.to_csv(index=False),
-                file_name="move_log.csv", mime="text/csv",
-            )
-
     # For the router-level matrix, only rows whose ground truth is actually non-medical
     # are in scope (medical docs never go through the router). Rows where triage
     # predicted "medical" but the true class was non-medical still belong in this matrix
@@ -391,7 +256,7 @@ def main():
             df, true_col="triage_gt", pred_col="triage_decision",
             reason_cols=["triage_reason"], conf_cols=["triage_confidence"],
             title="Triage: triage_gt vs triage_decision",
-            key_prefix="triage", base_dir=base_dir,
+            key_prefix="triage",
         )
 
     with tab2:
@@ -400,7 +265,7 @@ def main():
             reason_cols=["triage_reason", "router_reason"],
             conf_cols=["triage_confidence", "router_confidence"],
             title="Router: router_gt vs router_decision",
-            key_prefix="router", base_dir=base_dir,
+            key_prefix="router",
             scope_note=(
                 f"Scoped to the {len(router_scope)} row(s) whose ground truth is non-medical "
                 f"(medical docs never reach the router). Rows labeled '{ROUTER_NA_LABEL}' are cascading "
@@ -414,7 +279,7 @@ def main():
             reason_cols=["triage_reason", "router_reason", "specialist_reason"],
             conf_cols=["triage_confidence", "router_confidence", "specialist_confidence"],
             title="Final Leaf: ground_truth vs final_subcategory",
-            key_prefix="leaf", base_dir=base_dir,
+            key_prefix="leaf",
             scope_note="End-to-end accuracy across all three stages combined.",
         )
 
