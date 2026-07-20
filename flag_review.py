@@ -26,7 +26,7 @@ st.set_page_config(page_title="Multi-Label Review", layout="wide")
 LABELS = ["xray", "ultrasound", "ecg"]
 
 # Dynamically build the required columns based on the labels
-REQUIRED_COLS = ["filepath"]
+REQUIRED_COLS = ["filepath", "flags_reason"]
 for label in LABELS:
     REQUIRED_COLS.extend([f"{label}_gt", f"contains_{label}", f"contains_{label}_confidence"])
 
@@ -76,7 +76,7 @@ def render_sample(row, idx):
             for label in LABELS:
                 gt_val = row.get(f"{label}_gt")
                 pred_val = row.get(f"contains_{label}")
-                conf = row.get(f"{pred_val}_confidence", 0.0)
+                conf = row.get(f"contains_{label}_confidence", 0.0)
                 
                 status = "Correct" if gt_val == pred_val else ("False Positive" if pred_val else "False Negative")
                 
@@ -98,6 +98,9 @@ def render_sample(row, idx):
                 st.info(f"Could not load image from path:\n`{fp}`")
 
         with c2:
+            st.markdown("**Reasoning (flags_reason)**")
+            st.write(row.get("flags_reason", "No reasoning provided."))
+            
             st.markdown("**OCR text**")
             st.text_area(
                 "ocr_text", value=str(row.get("ocr_text", "")),
@@ -209,7 +212,7 @@ def render_drilldown_tab(df: pd.DataFrame):
             filtered = filtered[condition]
 
     if sort_by_conf and label_filter != "All":
-        filtered = filtered.sort_values(by=f"{label_filter.lower()}_conf", ascending=True)
+        filtered = filtered.sort_values(by=f"contains_{label_filter.lower()}_confidence", ascending=True)
 
     st.write(f"**{len(filtered)}** matching sample(s)")
 
