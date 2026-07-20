@@ -28,7 +28,7 @@ LABELS = ["xray", "ultrasound", "ecg"]
 # Dynamically build the required columns based on the labels
 REQUIRED_COLS = ["filepath"]
 for label in LABELS:
-    REQUIRED_COLS.extend([f"{label}_gt", f"contains_{label}", f"{label}_conf"])
+    REQUIRED_COLS.extend([f"{label}_gt", f"contains_{label}", f"contains_{label}_conf"])
 
 @st.cache_data
 def load_data(file):
