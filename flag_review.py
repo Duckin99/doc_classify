@@ -76,7 +76,7 @@ def render_sample(row, idx):
             for label in LABELS:
                 gt_val = row.get(f"{label}_gt")
                 pred_val = row.get(f"contains_{label}")
-                conf = row.get(f"{label}_conf", 0.0)
+                conf = row.get(f"{pred_val}_confidence", 0.0)
                 
                 status = "Correct" if gt_val == pred_val else ("False Positive" if pred_val else "False Negative")
                 
