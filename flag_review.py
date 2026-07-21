@@ -6,10 +6,10 @@ Run locally with:
     streamlit run multi_label_review.py
 
 Expects a CSV with (at minimum) these columns:
-    filepath,
+    filepath, flags_reason,
     xray_gt, ultrasound_gt, ecg_gt,
     contains_xray, contains_ultrasound, contains_ecg,
-    xray_conf, ultrasound_conf, ecg_conf
+    contains_xray_confidence, contains_ultrasound_confidence, contains_ecg_confidence
 
 If an `ocr_text` column is missing, a placeholder is automatically generated.
 """
@@ -18,6 +18,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from pathlib import Path
 
 st.set_page_config(page_title="Multi-Label Review", layout="wide")
@@ -39,7 +40,7 @@ def load_data(file):
             lambda fp: f"[OCR TEXT PLACEHOLDER -- column not wired up yet. File: {fp}]"
         )
     
-    # Ensure boolean columns are strictly boolean/integers for plotting
+    # Ensure boolean columns are strictly boolean for calculations
     for label in LABELS:
         gt_col = f"{label}_gt"
         pred_col = f"contains_{label}"
@@ -53,14 +54,12 @@ def load_data(file):
 def render_sample(row, idx):
     """Renders a single document sample with its multi-label predictions."""
     
-    # Build a quick summary string for the header
     gt_tags = [L.upper() for L in LABELS if row.get(f"{L}_gt")]
     pred_tags = [L.upper() for L in LABELS if row.get(f"contains_{L}")]
     
     gt_str = ", ".join(gt_tags) if gt_tags else "NONE"
     pred_str = ", ".join(pred_tags) if pred_tags else "NONE"
     
-    # Determine if it's a perfect match for visual cue
     is_perfect = set(gt_tags) == set(pred_tags)
     icon = "✅" if is_perfect else "⚠️"
     
@@ -71,7 +70,6 @@ def render_sample(row, idx):
 
         with c1:
             st.markdown("**Predictions vs Ground Truth**")
-            # Create a clean display table for this specific document
             doc_stats = []
             for label in LABELS:
                 gt_val = row.get(f"{label}_gt")
@@ -99,7 +97,7 @@ def render_sample(row, idx):
 
         with c2:
             st.markdown("**Reasoning (flags_reason)**")
-            st.write(row.get("flags_reason", "No reasoning provided."))
+            st.info(row.get("flags_reason", "No reasoning provided."))
             
             st.markdown("**OCR text**")
             st.text_area(
@@ -110,23 +108,17 @@ def render_sample(row, idx):
 
 
 def render_performance_metrics(df: pd.DataFrame):
-    """Calculates and displays global multi-label performance metrics."""
+    """Calculates and displays global multi-label performance metrics and visualizations."""
     st.subheader("Aggregate Performance Metrics")
     
-    metrics = []
-    perfect_match_count = 0
-    
-    # Calculate Exact Match Ratio (Subset Accuracy)
-    for _, row in df.iterrows():
-        is_exact = all(row[f"{L}_gt"] == row[f"contains_{L}"] for L in LABELS)
-        if is_exact:
-            perfect_match_count += 1
-            
+    # 1. Exact Match Ratio
+    perfect_match_count = sum(all(row[f"{L}_gt"] == row[f"contains_{L}"] for L in LABELS) for _, row in df.iterrows())
     exact_match_ratio = perfect_match_count / len(df) if len(df) > 0 else 0
     st.metric("Exact Match Ratio (All labels correct)", f"{exact_match_ratio:.2%}", help=f"{perfect_match_count} / {len(df)} documents")
     st.divider()
     
-    # Calculate per-label metrics
+    # 2. Per-Label Metrics Calculation
+    metrics = []
     for label in LABELS:
         gt_col = f"{label}_gt"
         pred_col = f"contains_{label}"
@@ -147,25 +139,50 @@ def render_performance_metrics(df: pd.DataFrame):
             "Precision": precision,
             "Recall": recall,
             "F1 Score": f1,
-            "Support (GT Count)": int((df[gt_col] == True).sum())
+            "Support (GT Count)": int((df[gt_col] == True).sum()),
+            "TP": tp, "FP": fp, "FN": fn, "TN": tn
         })
         
     metrics_df = pd.DataFrame(metrics)
     
-    # Render Bar Chart for Metrics
-    fig = go.Figure(data=[
-        go.Bar(name='Precision', x=metrics_df['Modality'], y=metrics_df['Precision'], marker_color='#1f77b4'),
-        go.Bar(name='Recall', x=metrics_df['Modality'], y=metrics_df['Recall'], marker_color='#ff7f0e'),
-        go.Bar(name='F1 Score', x=metrics_df['Modality'], y=metrics_df['F1 Score'], marker_color='#2ca02c')
-    ])
-    fig.update_layout(barmode='group', title="Per-Label Precision, Recall, and F1", yaxis_tickformat='.0%')
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Show underlying data table formatted nicely
-    display_df = metrics_df.copy()
-    for col in ["Accuracy", "Precision", "Recall", "F1 Score"]:
-        display_df[col] = display_df[col].apply(lambda x: f"{x:.2%}")
-    st.dataframe(display_df, hide_index=True, use_container_width=True)
+    # 3. Bar Chart for Precision/Recall/F1
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        fig_bar = go.Figure(data=[
+            go.Bar(name='Precision', x=metrics_df['Modality'], y=metrics_df['Precision'], marker_color='#1f77b4'),
+            go.Bar(name='Recall', x=metrics_df['Modality'], y=metrics_df['Recall'], marker_color='#ff7f0e'),
+            go.Bar(name='F1 Score', x=metrics_df['Modality'], y=metrics_df['F1 Score'], marker_color='#2ca02c')
+        ])
+        fig_bar.update_layout(barmode='group', title="Per-Label Precision, Recall, and F1", yaxis_tickformat='.0%', margin=dict(t=40, b=0))
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+    with c2:
+        st.markdown("**Metrics Table**")
+        display_df = metrics_df[['Modality', 'Accuracy', 'Precision', 'Recall', 'F1 Score', 'Support (GT Count)']].copy()
+        for col in ["Accuracy", "Precision", "Recall", "F1 Score"]:
+            display_df[col] = display_df[col].apply(lambda x: f"{x:.2%}")
+        st.dataframe(display_df, hide_index=True, use_container_width=True)
+
+    st.divider()
+
+    # 4. Individual 2x2 Confusion Matrices
+    st.subheader("Per-Label Confusion Matrices")
+    cols = st.columns(len(LABELS))
+    for i, label in enumerate(LABELS):
+        with cols[i]:
+            m = metrics_df[metrics_df['Modality'] == label.upper()].iloc[0]
+            z = [[m['TN'], m['FP']], [m['FN'], m['TP']]]
+            fig_cm = px.imshow(
+                z,
+                x=['Pred: False', 'Pred: True'],
+                y=['GT: False', 'GT: True'],
+                text_auto=True,
+                color_continuous_scale="Blues",
+                title=f"{label.upper()}"
+            )
+            fig_cm.update_layout(coloraxis_showscale=False, margin=dict(t=40, b=0, l=0, r=0), height=300)
+            st.plotly_chart(fig_cm, use_container_width=True)
+
 
 def render_drilldown_tab(df: pd.DataFrame):
     """Renders the filtering and sample drill-down section."""
@@ -194,13 +211,11 @@ def render_drilldown_tab(df: pd.DataFrame):
     else:
         # Global multi-label filtering
         if condition_filter == "Exact Matches":
-            # Must be perfect across all labels
             condition = pd.Series([True] * len(filtered), index=filtered.index)
             for L in LABELS:
                 condition = condition & (filtered[f"{L}_gt"] == filtered[f"contains_{L}"])
             filtered = filtered[condition]
         elif condition_filter in ["Any Error", "False Positives", "False Negatives"]:
-            # Has at least one error across any label
             condition = pd.Series([False] * len(filtered), index=filtered.index)
             for L in LABELS:
                 if condition_filter == "Any Error":
