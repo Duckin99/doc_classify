@@ -139,35 +139,35 @@ def render_performance_metrics(df: pd.DataFrame):
             "Precision": precision,
             "Recall": recall,
             "F1 Score": f1,
-            "Support (GT Count)": int((df[gt_col] == True).sum()),
-            "TP": tp, "FP": fp, "FN": fn, "TN": tn
+            "Support (GT Count)": int((df[gt_col] == True).sum())
         })
         
     metrics_df = pd.DataFrame(metrics)
     
-    # 3. Bar Chart for Precision/Recall/F1 (Full Width)
-    fig_bar = go.Figure(data=[
-        go.Bar(name='Precision', x=metrics_df['Modality'], y=metrics_df['Precision'], marker_color='#1f77b4'),
-        go.Bar(name='Recall', x=metrics_df['Modality'], y=metrics_df['Recall'], marker_color='#ff7f0e'),
-        go.Bar(name='F1 Score', x=metrics_df['Modality'], y=metrics_df['F1 Score'], marker_color='#2ca02c')
+    # Render Bar Chart for Metrics (Full Width)
+    fig = go.Figure(data=[
+        go.Bar(name='Precision', x=metrics_df['Modality'], y=metrics_df['Precision'], 
+               marker_color='#5E81AC', text=metrics_df['Precision'], texttemplate='%{text:.1%}', textposition='outside'),
+        go.Bar(name='Recall', x=metrics_df['Modality'], y=metrics_df['Recall'], 
+               marker_color='#EBCB8B', text=metrics_df['Recall'], texttemplate='%{text:.1%}', textposition='outside'),
+        go.Bar(name='F1 Score', x=metrics_df['Modality'], y=metrics_df['F1 Score'], 
+               marker_color='#A3BE8C', text=metrics_df['F1 Score'], texttemplate='%{text:.1%}', textposition='outside')
     ])
-    fig_bar.update_layout(
+    fig.update_layout(
         barmode='group', 
         title="Per-Label Precision, Recall, and F1", 
-        yaxis_tickformat='.0%', 
-        margin=dict(t=40, b=0)
+        yaxis_tickformat='.0%',
+        yaxis_range=[0, 1.15], # Extend slightly so outside text fits
+        plot_bgcolor='rgba(0,0,0,0)',
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
-    st.plotly_chart(fig_bar, use_container_width=True)
-
-    # 4. Metrics Table (Full Width)
-    st.markdown("**Detailed Metrics Table**")
-    display_df = metrics_df[['Modality', 'Accuracy', 'Precision', 'Recall', 'F1 Score', 'Support (GT Count)']].copy()
-    for col in ["Accuracy", "Precision", "Recall", "F1 Score"]:
-        display_df[col] = display_df[col].apply(lambda x: f"{x:.2%}")
-    st.dataframe(display_df, hide_index=True, use_container_width=True)
-
-    st.divider()
-
+    # Add subtle y-axis grid lines
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(0,0,0,0.1)')
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Show underlying data table formatted nicely (Full Width)
+    display_df = metrics_df.copy()
     # 5. Individual 2x2 Confusion Matrices
     st.subheader("Per-Label Confusion Matrices")
     cols = st.columns(len(LABELS))
