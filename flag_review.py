@@ -139,7 +139,11 @@ def render_performance_metrics(df: pd.DataFrame):
             "Precision": precision,
             "Recall": recall,
             "F1 Score": f1,
-            "Support (GT Count)": int((df[gt_col] == True).sum())
+            "Support (GT Count)": int((df[gt_col] == True).sum()),
+            "TP": tp,
+            "FP": fp,
+            "FN": fn,
+            "TN": tn
         })
         
     metrics_df = pd.DataFrame(metrics)
@@ -147,11 +151,11 @@ def render_performance_metrics(df: pd.DataFrame):
     # Render Bar Chart for Metrics (Full Width)
     fig = go.Figure(data=[
         go.Bar(name='Precision', x=metrics_df['Modality'], y=metrics_df['Precision'], 
-               marker_color='#5E81AC', text=metrics_df['Precision'], texttemplate='%{text:.1%}', textposition='outside'),
+               marker_color='#5C6BC0', text=metrics_df['Precision'], texttemplate='%{text:.1%}', textposition='outside'),
         go.Bar(name='Recall', x=metrics_df['Modality'], y=metrics_df['Recall'], 
-               marker_color='#EBCB8B', text=metrics_df['Recall'], texttemplate='%{text:.1%}', textposition='outside'),
+               marker_color='#7E57C2', text=metrics_df['Recall'], texttemplate='%{text:.1%}', textposition='outside'),
         go.Bar(name='F1 Score', x=metrics_df['Modality'], y=metrics_df['F1 Score'], 
-               marker_color='#A3BE8C', text=metrics_df['F1 Score'], texttemplate='%{text:.1%}', textposition='outside')
+               marker_color='#3F51B5', text=metrics_df['F1 Score'], texttemplate='%{text:.1%}', textposition='outside')
     ])
     fig.update_layout(
         barmode='group', 
@@ -167,7 +171,11 @@ def render_performance_metrics(df: pd.DataFrame):
     st.plotly_chart(fig, use_container_width=True)
     
     # Show underlying data table formatted nicely (Full Width)
-    display_df = metrics_df.copy()
+    display_df = metrics_df.drop(columns=['TP', 'FP', 'FN', 'TN']).copy()
+    for col in ["Accuracy", "Precision", "Recall", "F1 Score"]:
+        display_df[col] = display_df[col].apply(lambda x: f"{x:.2%}")
+    st.dataframe(display_df, hide_index=True, use_container_width=True)
+
     # 5. Individual 2x2 Confusion Matrices
     st.subheader("Per-Label Confusion Matrices")
     cols = st.columns(len(LABELS))
