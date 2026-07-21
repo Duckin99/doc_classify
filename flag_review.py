@@ -145,27 +145,30 @@ def render_performance_metrics(df: pd.DataFrame):
         
     metrics_df = pd.DataFrame(metrics)
     
-    # 3. Bar Chart for Precision/Recall/F1
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        fig_bar = go.Figure(data=[
-            go.Bar(name='Precision', x=metrics_df['Modality'], y=metrics_df['Precision'], marker_color='#1f77b4'),
-            go.Bar(name='Recall', x=metrics_df['Modality'], y=metrics_df['Recall'], marker_color='#ff7f0e'),
-            go.Bar(name='F1 Score', x=metrics_df['Modality'], y=metrics_df['F1 Score'], marker_color='#2ca02c')
-        ])
-        fig_bar.update_layout(barmode='group', title="Per-Label Precision, Recall, and F1", yaxis_tickformat='.0%', margin=dict(t=40, b=0))
-        st.plotly_chart(fig_bar, use_container_width=True)
+    # 3. Bar Chart for Precision/Recall/F1 (Full Width)
+    fig_bar = go.Figure(data=[
+        go.Bar(name='Precision', x=metrics_df['Modality'], y=metrics_df['Precision'], marker_color='#1f77b4'),
+        go.Bar(name='Recall', x=metrics_df['Modality'], y=metrics_df['Recall'], marker_color='#ff7f0e'),
+        go.Bar(name='F1 Score', x=metrics_df['Modality'], y=metrics_df['F1 Score'], marker_color='#2ca02c')
+    ])
+    fig_bar.update_layout(
+        barmode='group', 
+        title="Per-Label Precision, Recall, and F1", 
+        yaxis_tickformat='.0%', 
+        margin=dict(t=40, b=0)
+    )
+    st.plotly_chart(fig_bar, use_container_width=True)
 
-    with c2:
-        st.markdown("**Metrics Table**")
-        display_df = metrics_df[['Modality', 'Accuracy', 'Precision', 'Recall', 'F1 Score', 'Support (GT Count)']].copy()
-        for col in ["Accuracy", "Precision", "Recall", "F1 Score"]:
-            display_df[col] = display_df[col].apply(lambda x: f"{x:.2%}")
-        st.dataframe(display_df, hide_index=True, use_container_width=True)
+    # 4. Metrics Table (Full Width)
+    st.markdown("**Detailed Metrics Table**")
+    display_df = metrics_df[['Modality', 'Accuracy', 'Precision', 'Recall', 'F1 Score', 'Support (GT Count)']].copy()
+    for col in ["Accuracy", "Precision", "Recall", "F1 Score"]:
+        display_df[col] = display_df[col].apply(lambda x: f"{x:.2%}")
+    st.dataframe(display_df, hide_index=True, use_container_width=True)
 
     st.divider()
 
-    # 4. Individual 2x2 Confusion Matrices
+    # 5. Individual 2x2 Confusion Matrices
     st.subheader("Per-Label Confusion Matrices")
     cols = st.columns(len(LABELS))
     for i, label in enumerate(LABELS):
