@@ -302,109 +302,49 @@ def run_cascade_pipeline(ocr_text: str, image_path: str, client: AzureOpenAI,
 # 5. MULTITHREADED BATCH DATAFRAME RUNNER
 # ==========================================
 
-_checkpoint_lock = threading.Lock()
-
-def _process_one_row(idx, row, client, macro_model, specialist_model, use_vision, use_cot):
-    ocr_text = str(row.get("ocr_text", ""))
-    filepath = str(row.get("filepath", ""))
-    
-    try:
-        res = run_cascade_pipeline(ocr_text, filepath, client, macro_model, specialist_model, use_vision, use_cot)
-    except BadRequestError as e:
-        error_message = str(e).lower()
-        if "content management policy" in error_message or "jailbreak" in error_message:
-            print(f"[WARNING] Doc {idx + 1} blocked by Azure Jailbreak Filter. Skipping...")
-            res = {
-                "macro_decision": "blocked_by_firewall",
-                "macro_reason": "Azure OpenAI Content Filter flagged this OCR text as a jailbreak attempt.",
-                "macro_confidence": 0.0,
-                "macro_latency_sec": 0.0,
-                "macro_tokens_in": 0,
-                "macro_tokens_out": 0,
-                "final_subcategory": "error_content_filter",
-                "specialist_reason": "Skipped due to API security policy.",
-                "specialist_confidence": 0.0,
-                "specialist_latency_sec": 0.0,
-                "specialist_tokens_in": 0,
-                "specialist_tokens_out": 0,
-            }
-        else:
-            raise e
-    except Exception as e:
-        print(f"[ERROR] Doc {idx + 1} failed due to unexpected error: {e}")
-        res = {
-            "macro_decision": "api_error",
-            "macro_reason": str(e),
-            "macro_confidence": 0.0,
-            "macro_latency_sec": 0.0,
-            "macro_tokens_in": 0,
-            "macro_tokens_out": 0,
-            "final_subcategory": "api_error",
-            "specialist_reason": "API disconnected or failed.",
-            "specialist_confidence": 0.0,
-            "specialist_latency_sec": 0.0,
-            "specialist_tokens_in": 0,
-            "specialist_tokens_out": 0,
-        }
-
-    combined_row = {"filepath": filepath, **res}
-    return idx, combined_row
-
-def run_cascade_batch(csv_path: str, endpoint: str, api_key: str,
+def run_cascade_batch(df: pd.DataFrame, client: AzureOpenAI, text_col: str = "ocr_text", img_col: str = "filepath",
                       macro_model: str = "gpt-5.4-mini-swe-d-clab-model01",
                       specialist_model: str = "gpt-5.4-mini-swe-d-clab-model01",
-                      use_vision: bool = False,
-                      use_cot: bool = True, max_workers: int = 5,
-                      checkpoint_path: str = "cascade_results.csv",
-                      resume: bool = True) -> pd.DataFrame:
+                      use_vision: bool = False, use_cot: bool = True, max_workers: int = 5) -> pd.DataFrame:
+    """
+    Runs the cascade pipeline over a pandas DataFrame using multi-threading.
+    Returns the original DataFrame joined with the separated pipeline metrics.
+    """
+    results = []
     
-    client = AzureOpenAI(azure_endpoint=endpoint, api_key=api_key, api_version="2024-08-01-preview")
-    df = pd.read_csv(csv_path)
+    def process_row(idx, row):
+        ocr_text = str(row.get(text_col, ""))
+        img_path = str(row.get(img_col, "")) if pd.notna(row.get(img_col)) else None
+        
+        try:
+            res = run_cascade_pipeline(ocr_text, img_path, client, macro_model, specialist_model, use_vision, use_cot)
+            res["_idx"] = idx
+            return res
+        except BadRequestError as e:
+            error_message = str(e).lower()
+            if "content management policy" in error_message or "jailbreak" in error_message:
+                return {
+                    "_idx": idx, "macro_decision": "blocked_by_firewall",
+                    "macro_reason": "Azure OpenAI Content Filter flagged this text.",
+                    "macro_confidence": 0.0, "macro_latency_sec": 0.0,
+                    "macro_tokens_in": 0, "macro_tokens_out": 0,
+                    "final_subcategory": "error_content_filter",
+                    "specialist_reason": "Skipped due to API security policy.",
+                    "specialist_confidence": 0.0, "specialist_latency_sec": 0.0,
+                    "specialist_tokens_in": 0, "specialist_tokens_out": 0
+                }
+            return {"_idx": idx, "macro_decision": "api_error", "macro_reason": str(e)}
+        except Exception as e:
+            return {"_idx": idx, "macro_decision": "error", "macro_reason": str(e)}
 
-    already_done = set()
-    if resume and os.path.isfile(checkpoint_path):
-        prior = pd.read_csv(checkpoint_path)
-        if 'filepath' in prior.columns:
-            already_done = set(prior['filepath'].dropna().astype(str))
-        print(f"Resuming: {len(already_done)} document(s) already in checkpoint, will be skipped.")
-
-    pending = [(idx, row) for idx, row in df.iterrows() if str(row.get('filepath')) not in already_done]
     mode_str = "MULTIMODAL VLM (Text + Image)" if use_vision else "TEXT-ONLY"
-    print(f"Running cascade agent in [{mode_str}] mode on {len(pending)} document(s) with max_workers={max_workers}...")
-
-    fieldnames = None
-
-    def write_row(combined_row):
-        nonlocal fieldnames
-        with _checkpoint_lock:
-            file_exists = os.path.isfile(checkpoint_path)
-            if fieldnames is None:
-                if file_exists:
-                    fieldnames = list(pd.read_csv(checkpoint_path, nrows=0).columns)
-                else:
-                    fieldnames = list(combined_row.keys())
-            with open(checkpoint_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                if not file_exists:
-                    writer.writeheader()
-                writer.writerow(combined_row)
-
-    completed = 0
-    iterator_kwargs = dict(total=len(pending)) if HAS_TQDM else {}
+    print(f"Running cascade agent in [{mode_str}] mode on {len(df)} document(s) with max_workers={max_workers}...")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_process_one_row, idx, row, client, macro_model, specialist_model, use_vision, use_cot): idx 
-            for idx, row in pending
-        }
-        progress = tqdm(as_completed(futures), **iterator_kwargs) if HAS_TQDM else as_completed(futures)
-        for future in progress:
-            idx, res_row = future.result()
-            write_row(res_row)
-            completed += 1
-            if not HAS_TQDM:
-                print(f"[{completed}/{len(pending)}] {res_row.get('filepath')} "
-                      f"Macro: {res_row['macro_decision']} -> Leaf: {res_row['final_subcategory']}")
-
-    print(f"\nDone. {completed} document(s) processed this run. Results in '{checkpoint_path}'.")
-    return pd.read_csv(checkpoint_path)
+        futures = {executor.submit(process_row, idx, row): idx for idx, row in df.iterrows()}
+        iterator = tqdm(as_completed(futures), total=len(futures), desc="Classifying Docs") if HAS_TQDM else as_completed(futures)
+        for future in iterator:
+            results.append(future.result())
+    
+    results_df = pd.DataFrame(results).set_index("_idx")
+    return df.join(results_df)
