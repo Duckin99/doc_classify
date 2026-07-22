@@ -256,6 +256,8 @@ def run_cascade_pipeline(ocr_text: str, image_path: str, client: AzureOpenAI,
     macro_reason = getattr(macro_data, "chain_of_thought", "CoT disabled")
 
     base_result = {
+        "filepath": image_path,
+        "ocr_text": ocr_text,
         "macro_decision": macro_class,
         "macro_reason": macro_reason,
         "macro_confidence": macro_conf,
