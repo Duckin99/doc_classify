@@ -101,13 +101,15 @@ Default when nothing above applies. The underwriter will not use this document.
 AGENT1_USER_PROMPT = "Classify the following raw OCR text into medical, financial, identification, or not_for_underwriting:\n{ocr_text}"
 
 FINANCIAL_BASE = """You are an expert Financial Document Specialist. You receive text already confirmed as financial. Perform granular classification into one of six leaf classes. Use markdown structure (tables, headers) where present. Do not process PII.
-
+ 
 - financial_bankstatement: running transactional ledgers, money transfers, account balances, mobile banking markers -- ideally a markdown table of dated transaction rows.
 - financial_bookbank: static account identity headers (bilingual accounts, branches, bank names) without a long transaction ledger.
 - financial_companyregistration: formal commercial corporate registry verbiage and certification signatures.
 - financial_selfincomedeclaration: the person reporting, clarifying, or declaring their own income, salary, or source of income -- regardless of whether it's laid out as a form or questionnaire.
 - financial_receipt: any proof-of-payment document -- hospital/pharmacy/medical treatment receipts, government license/permit fee receipts, retail receipts, or any other billing statement, regardless of what the payment was for.
-- financial_others: financial in nature but doesn't cleanly match the above -- also covers general agreements/contracts (lease, sale, business contracts)."""
+- financial_others: financial in nature but doesn't cleanly match the above -- also covers general agreements/contracts (lease, sale, business contracts).
+"""
+
 
 AGENT_FINANCIAL_USER_PROMPT = "Perform deep financial classification on this verified text:\n{ocr_text}"
 
@@ -135,11 +137,22 @@ MEDICAL_BASE = """You are a strict Medical Document Specialist. Categorize pre-v
  
 ### Subclass Priority & Evaluation Guides
 Evaluate in this priority order -- if multiple patterns are present on the same page, the higher-priority match wins.
-
-- medical_lab (highest priority): Laboratory test results. Contains tabular test data with columns for Test Name, Result, Units, and Reference Range. Keywords: CBC, BUN, Creatinine, Lipid Profile, Glucose, mg/dL, mmol/L, x10^3/uL. (Note: waveform studies go to clinical).
-- medical_healthcheck (second priority): Health check / physical examination data. Any page containing extractable vital signs or physical examination findings -- Blood Pressure, BMI, Heart Rate, Weight, Height, or a structured wellness summary.
-- medical_clinical (third priority): Everything genuinely medical that isn't extractable lab data or extractable vitals. Includes narrative notes, pathology reports, imaging (X-ray, ultrasound), and functional diagnostics (ECG/EKG, EEG, spirometry) with no extractable lab or vitals data.
-- medical_others: Medical documents that don't structurally fit any category above. SPECIFIC INCLUSION: always route Sleep Test reports here."""
+ 
+- **medical_lab (highest priority):** Laboratory test results. Contains tabular test data with columns for Test Name, Result, Units, and Reference Range.
+  Keywords: CBC, BUN, Creatinine, Lipid Profile, Glucose, mg/dL, mmol/L, x10^3/uL.
+  NOT included: waveform studies, signal recordings, or functional diagnostics (e.g., ECG, EKG, EMG, EEG, spirometry graphs, imaging reports) -- these go to medical_clinical instead (see below), unless the same page also carries extractable lab values, in which case medical_lab still wins.
+ 
+- **medical_healthcheck (second priority):** Health check / physical examination data. Any page containing extractable vital signs or physical examination findings -- Blood Pressure, BMI, Heart Rate, Weight, Height, or a structured wellness summary. Applies regardless of whether the source document is a dedicated checkup report (e.g., "Annual Health Checkup", "Executive Health Screening") or a clinical encounter record (OPD/IPD) that includes a Physical Examination (PE) section with structured vitals.
+ 
+- **medical_clinical (third priority):** Everything genuinely medical that isn't extractable lab data or extractable vitals. This is deliberately a broad category: medical_lab and medical_healthcheck feed a downstream extraction node that pulls structured values (test results, BMI, BP, weight) -- medical_clinical is the landing spot for real clinical content that node doesn't need structured values from. Includes:
+  - Clinical narrative/notes: doctor consultation notes, progress notes, admission or discharge summaries, diagnosis lists, prescriptions, treatment plans, operative notes, hospital course documentation. Typically has visit/admission dates, narrative assessments, plans, and medication orders.
+  - Pathology reports.
+  - Imaging or functional diagnostic reports with no extractable lab or vitals data on the page -- X-ray, ultrasound, ECG/EKG, EMG, EEG, spirometry, or similar studies.
+  NOT included: pages whose primary content is a table of vital signs or PE measurements (-> medical_healthcheck) or a lab results table (-> medical_lab).
+ 
+- **medical_others:** Medical documents that don't structurally fit any category above.
+  SPECIFIC INCLUSION: always route Sleep Test reports here.
+"""
 
 AGENT3_USER_PROMPT = "Perform deep clinical classification on this verified medical text:\n{ocr_text}"
 
