@@ -5,7 +5,7 @@ Features:
 - Independent Latency & Token Tracking (Macro vs. Specialist).
 - Dynamic Chain-of-Thought (CoT) Toggle (`use_cot=True/False`).
 - Joint Multimodal Synthesis (Text + Low-Detail Image).
-- Multithreaded DataFrame batch execution with auto-checkpointing.
+- Multithreaded DataFrame batch execution with checkpointing + resume.
 """
 
 import math
@@ -36,7 +36,7 @@ def get_schema(use_cot: bool, schema_type: str):
     fields = {}
     if use_cot:
         fields["chain_of_thought"] = (str, ...)
-        
+
     if schema_type == "macro":
         fields["macro_class"] = (Literal["medical", "financial", "identification", "not_for_underwriting"], ...)
     elif schema_type == "financial":
@@ -45,7 +45,7 @@ def get_schema(use_cot: bool, schema_type: str):
         fields["subcategory"] = (Literal["id_driverlicense", "id_fatca", "id_foreignerconfirmationform", "id_foreigner_nationalid", "id_visastamp", "id_thaievisa", "id_passport", "id_statelessid", "id_thainationalid", "id_workpermit", "id_houseregistration", "id_marriagecertificate", "id_birthcertificate", "id_others"], ...)
     elif schema_type == "medical":
         fields["subcategory"] = (Literal["medical_clinical", "medical_healthcheck", "medical_lab", "medical_others"], ...)
-        
+
     return create_model(f"{schema_type.capitalize()}Output", **fields)
 
 # ==========================================
@@ -172,7 +172,7 @@ def get_field_confidence(logprobs, field_value: str) -> float:
     if not logprobs or not logprobs.content: return 0.0
     tokens = logprobs.content
     token_strs = [t.token for t in tokens]
-    
+
     running, span_start, span_end = "", None, None
     for i, tok in enumerate(token_strs):
         prev_len = len(running)
@@ -185,7 +185,7 @@ def get_field_confidence(logprobs, field_value: str) -> float:
                 start_idx = j
                 if field_value in partial: break
             span_start, span_end = start_idx, end_idx
-            
+
     if span_start is None: return 0.0
     val_probs = [tokens[i].logprob for i in range(span_start, span_end + 1) if tokens[i].logprob is not None]
     return round(math.exp(sum(val_probs) / len(val_probs)) * 100, 2) if val_probs else 0.0
@@ -232,32 +232,30 @@ def call_agent_multimodal(client, model, system_prompt, user_prompt, ocr_text, i
     parsed_data = response.choices[0].message.parsed
     val_to_check = getattr(parsed_data, "macro_class", getattr(parsed_data, "subcategory", ""))
     conf = get_field_confidence(response.choices[0].logprobs, str(val_to_check))
-    
+
     return parsed_data, conf, latency, tokens_in, tokens_out
 
 # ==========================================
 # 4. CASCADE PIPELINE WITH SEPARATE METRICS
 # ==========================================
 
-def run_cascade_pipeline(ocr_text: str, image_path: str, client: AzureOpenAI,
+def run_cascade_pipeline(ocr_text: str, image_path: Optional[str], client: AzureOpenAI,
                          macro_model: str = "gpt-5.4-mini-swe-d-clab-model01",
                          specialist_model: str = "gpt-5.4-mini-swe-d-clab-model01",
                          use_vision: bool = False,
                          use_cot: bool = True) -> dict:
-    
+
     # --- STAGE 1: MACRO AGENT ---
     macro_schema = get_schema(use_cot, "macro")
     macro_prompt = build_prompt(MACRO_BASE, use_vision, use_cot)
     macro_data, macro_conf, macro_lat, macro_in, macro_out = call_agent_multimodal(
         client, macro_model, macro_prompt, AGENT1_USER_PROMPT, ocr_text, image_path, use_vision, macro_schema
     )
-    
+
     macro_class = macro_data.macro_class
     macro_reason = getattr(macro_data, "chain_of_thought", "CoT disabled")
 
     base_result = {
-        "filepath": image_path,
-        "ocr_text": ocr_text,
         "macro_decision": macro_class,
         "macro_reason": macro_reason,
         "macro_confidence": macro_conf,
@@ -301,52 +299,125 @@ def run_cascade_pipeline(ocr_text: str, image_path: str, client: AzureOpenAI,
     }
 
 # ==========================================
-# 5. MULTITHREADED BATCH DATAFRAME RUNNER
+# 5. MULTITHREADED BATCH RUNNER WITH CHECKPOINT + RESUME
 # ==========================================
+_RESULT_KEYS = [
+    "macro_decision", "macro_reason", "macro_confidence", "macro_latency_sec",
+    "macro_tokens_in", "macro_tokens_out",
+    "final_subcategory", "specialist_reason", "specialist_confidence",
+    "specialist_latency_sec", "specialist_tokens_in", "specialist_tokens_out",
+]
 
-def run_cascade_batch(df: pd.DataFrame, client: AzureOpenAI, text_col: str = "ocr_text", img_col: str = "filepath",
-                      macro_model: str = "gpt-5.4-mini-swe-d-clab-model01",
-                      specialist_model: str = "gpt-5.4-mini-swe-d-clab-model01",
-                      use_vision: bool = False, use_cot: bool = True, max_workers: int = 5) -> pd.DataFrame:
+_checkpoint_lock = threading.Lock()
+
+
+def _error_fallback(decision: str, reason: str) -> dict:
+    """Complete row matching _RESULT_KEYS, with None/0 for anything not knowable from
+    an error. Every row -- success or failure -- has the same columns this way."""
+    fallback = {k: None for k in _RESULT_KEYS}
+    fallback.update({
+        "macro_decision": decision, "macro_reason": reason, "macro_confidence": 0.0,
+        "macro_latency_sec": 0.0, "macro_tokens_in": 0, "macro_tokens_out": 0,
+        "final_subcategory": decision, "specialist_reason": reason, "specialist_confidence": 0.0,
+        "specialist_latency_sec": 0.0, "specialist_tokens_in": 0, "specialist_tokens_out": 0,
+    })
+    return fallback
+
+
+def _process_one_row(idx, row, client, text_col, img_col, macro_model, specialist_model, use_vision, use_cot):
+    ocr_text = str(row.get(text_col, ""))
+    img_path = str(row.get(img_col, "")) if pd.notna(row.get(img_col)) else None
+
+    try:
+        res = run_cascade_pipeline(ocr_text, img_path, client, macro_model, specialist_model, use_vision, use_cot)
+    except BadRequestError as e:
+        error_message = str(e).lower()
+        if "content management policy" in error_message or "jailbreak" in error_message:
+            print(f"[WARNING] Doc {idx + 1} blocked by content filter. Skipping...")
+            res = _error_fallback("blocked_by_firewall", "Azure OpenAI Content Filter flagged this text.")
+        else:
+            raise
+    except Exception as e:
+        print(f"[ERROR] Doc {idx + 1} failed: {e}")
+        res = _error_fallback("api_error", str(e))
+
+    combined_row = {
+        "filepath": img_path,
+        "ocr_text": ocr_text,
+        **res,
+    }
+    return idx, combined_row
+
+
+def run_cascade_batch_checkpointed(df: pd.DataFrame, client: AzureOpenAI,
+                                    text_col: str = "ocr_text", img_col: str = "filepath",
+                                    macro_model: str = "gpt-54-mini-swe-d-clab-model01",
+                                    specialist_model: str = "gpt-54-mini-swe-d-clab-model01",
+                                    use_vision: bool = False, use_cot: bool = True,
+                                    max_workers: int = 5,
+                                    checkpoint_path: str = "eval2/gpt54mini_cls_result.csv",
+                                    resume: bool = True) -> pd.DataFrame:
+    """Runs the cascade pipeline over df, writing each completed row to
+    checkpoint_path as it finishes rather than joining an in-memory results frame back
+    onto df at the end. Rerun with the same checkpoint_path to resume -- rows whose
+    img_col value is already in the checkpoint are skipped.
+
+    Returns the full checkpoint (including any rows resumed from a prior run), read
+    back from disk -- this is always the complete, ground-truth result set, not just
+    what this particular call processed.
     """
-    Runs the cascade pipeline over a pandas DataFrame using multi-threading.
-    Returns the original DataFrame joined with the separated pipeline metrics.
-    """
-    results = []
-    
-    def process_row(idx, row):
-        ocr_text = str(row.get(text_col, ""))
-        img_path = str(row.get(img_col, "")) if pd.notna(row.get(img_col)) else None
-        
-        try:
-            res = run_cascade_pipeline(ocr_text, img_path, client, macro_model, specialist_model, use_vision, use_cot)
-            res["_idx"] = idx
-            return res
-        except BadRequestError as e:
-            error_message = str(e).lower()
-            if "content management policy" in error_message or "jailbreak" in error_message:
-                return {
-                    "_idx": idx, "macro_decision": "blocked_by_firewall",
-                    "macro_reason": "Azure OpenAI Content Filter flagged this text.",
-                    "macro_confidence": 0.0, "macro_latency_sec": 0.0,
-                    "macro_tokens_in": 0, "macro_tokens_out": 0,
-                    "final_subcategory": "error_content_filter",
-                    "specialist_reason": "Skipped due to API security policy.",
-                    "specialist_confidence": 0.0, "specialist_latency_sec": 0.0,
-                    "specialist_tokens_in": 0, "specialist_tokens_out": 0
-                }
-            return {"_idx": idx, "macro_decision": "api_error", "macro_reason": str(e)}
-        except Exception as e:
-            return {"_idx": idx, "macro_decision": "error", "macro_reason": str(e)}
+    already_done = set()
+    if resume and os.path.isfile(checkpoint_path):
+        prior = pd.read_csv(checkpoint_path)
+        if img_col in prior.columns:
+            already_done = set(prior[img_col].dropna().astype(str))
+        print(f"Resuming: {len(already_done)} document(s) already in checkpoint, will be skipped.")
+
+    pending = [(idx, row) for idx, row in df.iterrows() if str(row.get(img_col)) not in already_done]
 
     mode_str = "MULTIMODAL VLM (Text + Image)" if use_vision else "TEXT-ONLY"
-    print(f"Running cascade agent in [{mode_str}] mode on {len(df)} document(s) with max_workers={max_workers}...")
+    print(f"Running cascade agent in [{mode_str}] mode on {len(pending)} document(s) "
+          f"(of {len(df)} total, {len(already_done)} already done) with max_workers={max_workers}...")
+
+    fieldnames = None
+
+    def write_row(combined_row):
+        nonlocal fieldnames
+        with _checkpoint_lock:
+            file_exists = os.path.isfile(checkpoint_path)
+            if fieldnames is None:
+                fieldnames = list(pd.read_csv(checkpoint_path, nrows=0).columns) if file_exists else list(combined_row.keys())
+            with open(checkpoint_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(combined_row)
+
+    completed = 0
+    iterator_kwargs = dict(total=len(pending), desc="Classifying Docs") if HAS_TQDM else {}
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_row, idx, row): idx for idx, row in df.iterrows()}
-        iterator = tqdm(as_completed(futures), total=len(futures), desc="Classifying Docs") if HAS_TQDM else as_completed(futures)
-        for future in iterator:
-            results.append(future.result())
-    
-    results_df = pd.DataFrame(results).set_index("_idx")
-    return df.join(results_df)
+        futures = {
+            executor.submit(_process_one_row, idx, row, client, text_col, img_col,
+                             macro_model, specialist_model, use_vision, use_cot): idx
+            for idx, row in pending
+        }
+        progress = tqdm(as_completed(futures), **iterator_kwargs) if HAS_TQDM else as_completed(futures)
+        for future in progress:
+            idx, combined_row = future.result()
+            write_row(combined_row)
+            completed += 1
+            if not HAS_TQDM:
+                print(f"[{completed}/{len(pending)}] {combined_row.get(img_col)} -> {combined_row.get('final_subcategory')}")
+
+    print(f"\nDone. {completed} document(s) processed this run. Full results in '{checkpoint_path}'.")
+    return pd.read_csv(checkpoint_path)
+
+# To run in your notebook cell:
+#
+# df_text = run_cascade_batch_checkpointed(
+#     df, client, use_vision=False, checkpoint_path="results_text_only.csv"
+# )
+# df_image = run_cascade_batch_checkpointed(
+#     df, client, use_vision=True, checkpoint_path="results_text_image.csv"
+# )
