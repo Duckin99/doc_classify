@@ -49,25 +49,57 @@ def get_schema(use_cot: bool, schema_type: str):
     return create_model(f"{schema_type.capitalize()}Output", **fields)
 
 # ==========================================
-# 2. PROMPTS (Preserving Original Tuning + Joint Multimodal Rule)
+# 2. PROMPTS
 # ==========================================
+# CHANGED (this round): logic fixes to MACRO_BASE / MEDICAL_BASE / ID_BASE based on
+# reviewing actual vision+text failures (see comments at each change site). Also
+# replaced the single generic MULTIMODAL_INSTRUCTION with PER-AGENT vision guidance
+# (MACRO_VISION_NOTE / MEDICAL_VISION_NOTE / ID_VISION_NOTE / FINANCIAL_VISION_NOTE) --
+# that's the actual "not customized per agent" gap you flagged. build_prompt now takes
+# a vision_note argument instead of always appending the same generic block.
 
-MULTIMODAL_INSTRUCTION = """
+GENERIC_VISION_NOTE = """
 
 ### Joint Multimodal Rule (Text + Image Synthesis)
-You receive BOTH the OCR/markdown text and the raw document image. Do not treat the image merely as a fallback. 
+You receive BOTH the OCR/markdown text and the raw document image. Do not treat the image merely as a fallback.
 The visual structure is critical context for:
 1. Low-text visual artifacts (e.g., foreign scripts like Lao IDs where OCR scrambles text, or raw ECG waveforms/X-ray films).
 2. Official stamps, seals, or layouts that provide ground-truth document structure."""
 
+# --- Macro: fixes for eForm-vs-financial confusion, envelope/hospital-name-only docs,
+# and portrait-holding-ID misrouted to identification. All three were cases where the
+# model over-weighted visual formality (a logo, a formal layout) instead of content.
+MACRO_VISION_NOTE = GENERIC_VISION_NOTE + """
+
+### Vision-specific guidance for macro classification
+- Company logos, letterheads, or institutional branding visible in the image (e.g. an insurer's logo in a corner, a Thai company address block) are branding elements common to MANY unrelated document types the insurer issues. They are NOT evidence of financial content -- weigh them the same as the ignored watermark text, not as a signal on their own.
+- If the image's main visible subject is a PERSON -- e.g. a selfie/portrait of someone holding up an ID card to the camera -- this is a portrait/liveness photo, not an identification document. Route to `not_for_underwriting`. A genuine identification document has the ID card/document itself as the flat, primary subject filling the frame, not a person holding it.
+- A document with very little OCR text (e.g. just a name and a short policy code) but a visually formal layout (e.g. resembling an envelope, letterhead, or official stationery) is still `not_for_underwriting` -- visual formality alone is not evidence of financial or medical content. This also applies to a hospital name/letterhead with no genuine clinical data or payment figures on the page -- that's still `not_for_underwriting`, not `medical` and not `financial`."""
+
+FINANCIAL_VISION_NOTE = GENERIC_VISION_NOTE
+
+# --- Identification: fixes for passport vs foreigner_nationalid confusion, and the
+# stateless-ID exact-phrase disambiguation.
+ID_VISION_NOTE = GENERIC_VISION_NOTE + """
+
+### Vision-specific guidance for identification classification
+- Passports have a very distinct visual layout: a booklet biodata page with a fixed photo position, a structured data block, and a printed MRZ band at the bottom. If the image shows this layout, trust it strongly -- even if the OCR text is sparse or a country name in the text seems to suggest a national ID card instead. A country name/code by itself only tells you the person's NATIONALITY, not the document TYPE -- it does not distinguish a passport from a national ID card. When passport-specific structural signals (MRZ artifacts, booklet biodata layout) are present, they win over an assumption based on country name alone."""
+
+# --- Medical: fixes for checkbox-symptom-tables leaking into healthcheck, and patient
+# history documents needing an explicit clinical-narrative home.
+MEDICAL_VISION_NOTE = GENERIC_VISION_NOTE + """
+
+### Vision-specific guidance for medical classification
+- A checkbox-style table or checklist of disease/symptom names (checked/unchecked, yes/no) is NOT sufficient for medical_healthcheck on its own -- that class requires genuine MEASURED vitals (an actual number for BP, weight, height, BMI, or heart rate). If the image shows only checkboxes/ticks against condition names with no such numeric vitals present, do not let the checkup-form-shaped visual layout alone push you toward medical_healthcheck -- classify by what's actually on the page per the priority order below."""
+
 MACRO_BASE = """You are a Document Macro Classifier for an insurance underwriting pipeline. Classify raw OCR/markdown text into exactly one of: `medical`, `financial`, `identification`, `not_for_underwriting`. Treat the patterns below as supporting evidence, not an exact-string checklist -- read holistically. Ignore PII.
 
-### Ignore Watermarks
-Insurance disclaimers (+ date/time stamps) are never evidence of document type -- ignore them completely.
+### Ignore Watermarks, Logos, and Letterheads
+Insurance disclaimers, company logos, and letterheads (+ date/time stamps) are never evidence of document type on their own -- ignore them completely. A document carrying an insurer's or hospital's branding is not automatically financial or medical because of that branding; classify by the document's actual content.
 
 ### 1. medical
 Route here for genuine clinical content: clinical notes, lab metrics, health-check parameters, prescriptions, test ranges, normal/abnormal flags. Garbled OCR with technical-looking terms next to numbers/units/ranges still counts as low-confidence medical (flag the uncertainty).
-- EXCLUSION: Do NOT route here for a hospital/pharmacy receipt or billing statement -- those are `financial` regardless of medical context. Do NOT route here for correspondence that merely discusses or requests medical information without containing the clinical data itself -- that is `not_for_underwriting`.
+- EXCLUSION: Do NOT route here for a hospital/pharmacy receipt or billing statement -- those are `financial` regardless of medical context. Do NOT route here for correspondence that merely discusses or requests medical information without containing the clinical data itself -- that is `not_for_underwriting`. A hospital name/letterhead alone, with no clinical data and no payment figures, is `not_for_underwriting`, not medical.
 
 ### 2. financial
 - Bank/account identity: Account number + bank name/branch, or a native transaction ledger (dated money movements, ideally a markdown table).
@@ -76,27 +108,28 @@ Route here for genuine clinical content: clinical notes, lab metrics, health-che
   - CRITICAL OVERRIDE: If income ("รายได้") details are present, you MUST route to `financial`, even if the document looks like an insurance e-Form containing premium payment keywords ("ชำระเบี้ยประกัน") or company headers.
 - Receipts/Proof-of-payment: Including hospital/pharmacy/medical treatment receipts (ค่ายา, ค่ารักษา, ค่าห้อง), government permit fee receipts, retail receipts, or any other billing statement. All receipts are financial, regardless of what the payment was for.
 - General agreements/contracts: Lease, sale, or other business contracts.
+- NOT financial: a company logo, letterhead, or formal-looking layout alone, with no bank ledger, registration number, income declaration, receipt, or contract content actually present. Formal visual appearance is not itself financial evidence -- see the eForm Trap below.
 
 ### 3. identification
 A genuine ID/travel/civil-registry document with its own native structure (not a field filled into someone else's form):
-- National/Stateless ID: Issuing country name/code (e.g., "LAO PDR", "RDP LAO"), a genuine name+DOB or name+issue/expiry block. Look for "รับรองสำเนาถูกต้อง" (certified true copy) or `<figure>` tags wrapping personal-detail blocks. Stateless-ID text or garbled non-Thai script (e.g., Lao misread as Thai) combined with a country-code header also counts.
-- Passports/Visas: MRZ lines (letters/digits + long "<" runs, e.g., "PA123<<<<<<<"), or immigration/visa keywords ("VISA", "VISACLASS", "IMMIGRATION", "DEPARTED", "ADMITTED", "ENTRY") near messy digits/dates.
+- National/Stateless ID: Issuing country name/code (e.g., "LAO PDR", "RDP LAO"), a genuine name+DOB or name+issue/expiry block. Look for "รับรองสำเนาถูกต้อง" (certified true copy) or `<figure>` tags wrapping personal-detail blocks. Stateless-ID text or garbled non-Thai script (e.g., Lao misread as Thai) combined with a country-code header also counts. NOTE: a country name/code tells you nationality, not document type -- it does not by itself distinguish a national ID from a passport; see Passports/Visas below for passport-specific signals.
+- Passports/Visas: MRZ lines (letters/digits + long "<" runs, e.g., "PA123<<<<<<<" or similar garbled artifact patterns), or immigration/visa keywords ("VISA", "VISACLASS", "IMMIGRATION", "DEPARTED", "ADMITTED", "ENTRY") near messy digits/dates. These structural signals indicate a passport specifically, and take priority over a bare country-name match.
 - Thai E-Visa: The literal term "E-VISA" printed on the document is a strong, standalone anchor.
 - Tax Forms: FATCA-related tax forms (W-9, W-4, W-8BEN) or similar withholding declarations.
 - Work Permits: Labor authorization booklets, employer/employee details, type-of-work (ประเภทงาน), Department of Employment text. Includes renewals/amendments (รายการเปลี่ยนเพิ่มประเภทงาน).
 - Civil Registry: Household registration (ทะเบียนบ้าน), Marriage certificate (ใบสำคัญการสมรส / ทะเบียนสมรส), Birth certificate (สูติบัตร).
-- Other IDs: Student IDs, employee badges, or any physical identity card with a photo placeholder/ID number.
+- Other IDs: Student IDs, employee badges, or any physical identity card with a photo placeholder/ID number -- provided the ID DOCUMENT ITSELF is the primary subject (a flat scan/photo of the card), not a person holding it up (see not_for_underwriting).
 - Reminder: An ID document stamped with an insurance watermark/date is still `identification`.
 
 ### 4. not_for_underwriting
 Default when nothing above applies. The underwriter will not use this document.
-- Insurance application/policy paperwork (eForm Trap): Forms containing applicant fields (เบี้ยประกัน, policy details). 
-  - SPECIFIC ANCHORS: Documents opening with "บันทึกคำชี้แจงเกี่ยวกับใบคำขอประกันภัย", consent letters, OR documents containing "ชำระเบี้ยประกัน" (premium payment) mixed with a company name/address in the PageHeader. 
+- Insurance application/policy paperwork (eForm Trap): Forms containing applicant fields (เบี้ยประกัน, policy details), regardless of company letterhead, logos, or formal visual presentation. 
+  - SPECIFIC ANCHORS: A markdown title/heading resembling "บันทึกคำชี้แจ้ง/คำชี้แจง...เกี่ยวกับใบคำขอ(เอา)ประกันภัย" (a memo/note explaining details for an insurance application -- spelling varies), consent letters, OR documents containing "ชำระเบี้ยประกัน" (premium payment) mixed with a company name/address in the page header. These remain `not_for_underwriting` even when they carry an insurer's logo or letterhead -- that branding is expected on this document type and is not evidence it's financial.
   - EXCEPTION: If the document explicitly declares actual income details ("รายได้"), route to `financial` instead.
-- Litmus test for eForms: Strip out the applicant's name/ID/policy number -- is any standalone financial, clinical, or identity statement left? If nothing remains but "applying for / updating a policy," it belongs here.
+- Litmus test for eForms: Strip out the applicant's name/ID/policy number, the letterhead, and the logo -- is any standalone financial, clinical, or identity statement left? If nothing remains but "applying for / updating a policy," it belongs here, no matter how formal it looks.
 - Correspondence: Letters/memos between the insured and underwriter requesting documents (administrative communication).
-- Envelope/mailing metadata: Sender name, policy codes (e.g., "T1348646"), addressing text.
-- Photos/Noise: Portrait photos or ID placeholders without issuing text, or completely illegible noise."""
+- Envelope/mailing metadata: Sender name, policy codes (e.g., "T1348646"), addressing text, or a hospital name with no accompanying medical record content -- these stay here even if the layout looks visually formal or official.
+- Photos/Noise: Portrait photos or ID placeholders without issuing text. This includes a selfie/portrait where a person is holding up an ID card to the camera (a liveness/KYC-style photo) -- the person, not the document, is the main subject, so this is not `identification`."""
 
 AGENT1_USER_PROMPT = "Classify the following raw OCR text into medical, financial, identification, or not_for_underwriting:\n{ocr_text}"
 
@@ -116,15 +149,17 @@ AGENT_FINANCIAL_USER_PROMPT = "Perform deep financial classification on this ver
 ID_BASE = """You are an expert Identification Document Specialist. You receive text already confirmed as an identification/travel document. Perform granular classification. Use markdown structure where present. Do not process PII.
  
 Reminder: insurance watermarks/disclaimers (+ date/time stamps) are never evidence of document type -- ignore them when classifying.
+
+Reminder: a country name/code (e.g. "LAO PDR", "Union of Myanmar") tells you the person's NATIONALITY, not the document TYPE. It does not by itself mean id_foreigner_nationalid rather than id_passport -- check for passport-specific structural signals (MRZ garbled artifact patterns like "<<<<", a booklet biodata-page layout, a passport number field) before deciding. When those are present, they win over a bare country-name association.
  
-- id_thainationalid / id_foreigner_nationalid: national demographic card headers and identity issuing text blocks. Foreign-script documents (e.g. a Lao national ID) still count even if largely unreadable by OCR -- look for legible fragments like issuing country name/code, name, or a DOB pattern.
-- id_passport: the passport bio data page -- photo/data block, passport number, nationality, an MRZ line (letters/digits + long "<" runs).
+- id_thainationalid / id_foreigner_nationalid: national demographic card headers and identity issuing text blocks. Foreign-script documents (e.g. a Lao national ID) still count even if largely unreadable by OCR -- look for legible fragments like issuing country name/code, name, or a DOB pattern. Do NOT use this class just because a country name appears in the text -- confirm it's a national ID card layout, not a passport (see id_passport) or a stateless ID (see id_statelessid).
+- id_passport: the passport bio data page -- photo/data block, passport number, nationality, an MRZ line (letters/digits + long "<" runs, including garbled OCR fragments like "SACSDWsd<<<<" -- this pattern alone is a strong passport anchor even without a clean country name). If an image is available, a booklet biodata-page layout is a strong confirming signal.
 - id_visastamp: a Thai visa page and/or immigration control stamp -- visa category codes, "DEPARTED"/"ADMITTED"/"ENTRY" keywords, and (often garbled, since stamp text is curved) date-like digit strings near them. Does NOT include a Thai E-Visa (see id_thaievisa below).
 - id_thaievisa: a Thai Electronic Visa (E-Visa) -- look for the literal term "E-VISA" printed on the document; this alone is a reliable, standalone anchor for this class.
 - id_workpermit: labor authorization booklets and official employment permission context. This includes work permit RENEWALS and amendment/endorsement documents such as "Change or addition of category of work" (รายการเปลี่ยนเพิ่มประเภทงาน).
 - id_fatca: any FATCA-related US tax form -- W-9, W-4, W-8BEN, or similar FATCA/tax-status declaration or backup-withholding form, entity/individual tax certification sections.
 - id_foreignerconfirmationform: an official government-issued confirmation/declaration form attesting to a foreign national's identity or status -- issued BY a government/authority ABOUT the person.
-- id_statelessid: a stateless-person identity card -- card layout similar to a national ID (photo placeholder, ID number, name, DOB) but with issuing text indicating stateless/no-registered-nationality status.
+- id_statelessid: a stateless-person identity card -- card layout similar to a national ID (photo placeholder, ID number, name, DOB) but with issuing text indicating stateless/no-registered-nationality status. The exact phrase "บัตรประจำตัวคนไม่มีสัญชาติไทย" (identity card for a person without Thai nationality) ALWAYS means id_statelessid -- never id_foreigner_nationalid. This is a distinct Thai legal status (no registered nationality at all), not the same as a foreign national holding their own country's ID.
 - id_driverlicense: driver's license.
 - id_houseregistration: household registration document (ทะเบียนบ้าน) -- household registration book header, house/address registry formatting, list of household members.
 - id_marriagecertificate: marriage certificate (ใบทะเบียนสมรส) -- marriage registration terminology, groom/bride names, registrar signature, marriage date.
@@ -142,13 +177,15 @@ Evaluate in this priority order -- if multiple patterns are present on the same 
   Keywords: CBC, BUN, Creatinine, Lipid Profile, Glucose, mg/dL, mmol/L, x10^3/uL.
   NOT included: waveform studies, signal recordings, or functional diagnostics (e.g., ECG, EKG, EMG, EEG, spirometry graphs, imaging reports) -- these go to medical_clinical instead (see below), unless the same page also carries extractable lab values, in which case medical_lab still wins.
  
-- **medical_healthcheck (second priority):** Health check / physical examination data. Any page containing extractable vital signs or physical examination findings -- Blood Pressure, BMI, Heart Rate, Weight, Height, or a structured wellness summary. Applies regardless of whether the source document is a dedicated checkup report (e.g., "Annual Health Checkup", "Executive Health Screening") or a clinical encounter record (OPD/IPD) that includes a Physical Examination (PE) section with structured vitals.
- 
+- **medical_healthcheck (second priority):** Health check / physical examination data. Requires genuine MEASURED vitals -- an actual number/value for Blood Pressure, BMI, Heart Rate, Weight, Height, or a structured wellness summary with real measurements. Applies regardless of whether the source document is a dedicated checkup report (e.g., "Annual Health Checkup", "Executive Health Screening") or a clinical encounter record (OPD/IPD) that includes a Physical Examination (PE) section with structured vitals.
+  NOT included: a checkbox/checklist table of disease or symptom names (checked/unchecked, yes/no) with no accompanying numeric vitals -- that has the visual shape of a checkup form but no actual measured values, so it does not qualify here. Route it per medical_clinical or medical_others below instead.
+
 - **medical_clinical (third priority):** Everything genuinely medical that isn't extractable lab data or extractable vitals. This is deliberately a broad category: medical_lab and medical_healthcheck feed a downstream extraction node that pulls structured values (test results, BMI, BP, weight) -- medical_clinical is the landing spot for real clinical content that node doesn't need structured values from. Includes:
   - Clinical narrative/notes: doctor consultation notes, progress notes, admission or discharge summaries, diagnosis lists, prescriptions, treatment plans, operative notes, hospital course documentation. Typically has visit/admission dates, narrative assessments, plans, and medication orders.
+  - Patient history forms (ประวัติผู้ป่วย) -- including ones laid out as a checkbox/table of past conditions or symptoms -- these are history/narrative content, not a real-time physical exam with measured vitals.
   - Pathology reports.
   - Imaging or functional diagnostic reports with no extractable lab or vitals data on the page -- X-ray, ultrasound, ECG/EKG, EMG, EEG, spirometry, or similar studies.
-  NOT included: pages whose primary content is a table of vital signs or PE measurements (-> medical_healthcheck) or a lab results table (-> medical_lab).
+  NOT included: pages whose primary content is a table of vital signs or PE measurements with real numeric values (-> medical_healthcheck) or a lab results table (-> medical_lab).
  
 - **medical_others:** Medical documents that don't structurally fit any category above.
   SPECIFIC INCLUSION: always route Sleep Test reports here.
@@ -156,10 +193,10 @@ Evaluate in this priority order -- if multiple patterns are present on the same 
 
 AGENT3_USER_PROMPT = "Perform deep clinical classification on this verified medical text:\n{ocr_text}"
 
-def build_prompt(base_prompt: str, use_vision: bool, use_cot: bool) -> str:
+def build_prompt(base_prompt: str, use_vision: bool, use_cot: bool, vision_note: str = None) -> str:
     prompt = base_prompt
     if use_vision:
-        prompt += f"\n\n{MULTIMODAL_INSTRUCTION}"
+        prompt += vision_note if vision_note is not None else GENERIC_VISION_NOTE
     if use_cot:
         prompt += "\n\nIn chain_of_thought: Provide step-by-step structural rationale linking specific evidence to your decision."
     return prompt
@@ -251,6 +288,7 @@ def call_agent_multimodal(client, model, system_prompt, user_prompt, ocr_text, i
 # ==========================================
 # 4. CASCADE PIPELINE WITH SEPARATE METRICS
 # ==========================================
+# CHANGED: each build_prompt call now passes its own agent-specific vision_note.
 
 def run_cascade_pipeline(ocr_text: str, image_path: Optional[str], client: AzureOpenAI,
                          macro_model: str = "gpt-5.4-mini-swe-d-clab-model01",
@@ -260,7 +298,7 @@ def run_cascade_pipeline(ocr_text: str, image_path: Optional[str], client: Azure
 
     # --- STAGE 1: MACRO AGENT ---
     macro_schema = get_schema(use_cot, "macro")
-    macro_prompt = build_prompt(MACRO_BASE, use_vision, use_cot)
+    macro_prompt = build_prompt(MACRO_BASE, use_vision, use_cot, vision_note=MACRO_VISION_NOTE)
     macro_data, macro_conf, macro_lat, macro_in, macro_out = call_agent_multimodal(
         client, macro_model, macro_prompt, AGENT1_USER_PROMPT, ocr_text, image_path, use_vision, macro_schema
     )
@@ -290,13 +328,13 @@ def run_cascade_pipeline(ocr_text: str, image_path: Optional[str], client: Azure
 
     # --- STAGE 2: SPECIALIST AGENT ---
     if macro_class == "medical":
-        spec_schema, sys_p, user_p = get_schema(use_cot, "medical"), MEDICAL_BASE, AGENT3_USER_PROMPT
+        spec_schema, sys_p, user_p, vnote = get_schema(use_cot, "medical"), MEDICAL_BASE, AGENT3_USER_PROMPT, MEDICAL_VISION_NOTE
     elif macro_class == "financial":
-        spec_schema, sys_p, user_p = get_schema(use_cot, "financial"), FINANCIAL_BASE, AGENT_FINANCIAL_USER_PROMPT
+        spec_schema, sys_p, user_p, vnote = get_schema(use_cot, "financial"), FINANCIAL_BASE, AGENT_FINANCIAL_USER_PROMPT, FINANCIAL_VISION_NOTE
     else: # identification
-        spec_schema, sys_p, user_p = get_schema(use_cot, "id"), ID_BASE, AGENT_ID_USER_PROMPT
+        spec_schema, sys_p, user_p, vnote = get_schema(use_cot, "id"), ID_BASE, AGENT_ID_USER_PROMPT, ID_VISION_NOTE
 
-    spec_prompt = build_prompt(sys_p, use_vision, use_cot)
+    spec_prompt = build_prompt(sys_p, use_vision, use_cot, vision_note=vnote)
     spec_data, spec_conf, spec_lat, spec_in, spec_out = call_agent_multimodal(
         client, specialist_model, spec_prompt, user_p, ocr_text, image_path, use_vision, spec_schema
     )
