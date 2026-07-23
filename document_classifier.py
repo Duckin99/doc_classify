@@ -61,10 +61,7 @@ def get_schema(use_cot: bool, schema_type: str):
 GENERIC_VISION_NOTE = """
 
 ### Joint Multimodal Rule (Text + Image Synthesis)
-You receive BOTH the OCR/markdown text and the raw document image. Do not treat the image merely as a fallback.
-The visual structure is critical context for:
-1. Low-text visual artifacts (e.g., foreign scripts like Lao IDs where OCR scrambles text, or raw ECG waveforms/X-ray films).
-2. Official stamps, seals, or layouts that provide ground-truth document structure."""
+You receive BOTH the OCR/markdown text and the raw document image -- the image is not just a fallback for missing text. Use it for: low-text visual artifacts OCR often garbles (foreign scripts, ECG waveforms, X-ray films), and stamps/seals/layouts that confirm document structure."""
 
 # --- Macro: fixes for eForm-vs-financial confusion, envelope/hospital-name-only docs,
 # and portrait-holding-ID misrouted to identification. All three were cases where the
@@ -72,9 +69,9 @@ The visual structure is critical context for:
 MACRO_VISION_NOTE = GENERIC_VISION_NOTE + """
 
 ### Vision-specific guidance for macro classification
-- Company logos, letterheads, or institutional branding visible in the image (e.g. an insurer's logo in a corner, a Thai company address block) are branding elements common to MANY unrelated document types the insurer issues. They are NOT evidence of financial content -- weigh them the same as the ignored watermark text, not as a signal on their own.
-- If the image's main visible subject is a PERSON -- e.g. a selfie/portrait of someone holding up an ID card to the camera -- this is a portrait/liveness photo, not an identification document. Route to `not_for_underwriting`. A genuine identification document has the ID card/document itself as the flat, primary subject filling the frame, not a person holding it.
-- A document with very little OCR text (e.g. just a name and a short policy code) but a visually formal layout (e.g. resembling an envelope, letterhead, or official stationery) is still `not_for_underwriting` -- visual formality alone is not evidence of financial or medical content. This also applies to a hospital name/letterhead with no genuine clinical data or payment figures on the page -- that's still `not_for_underwriting`, not `medical` and not `financial`."""
+- Logos/letterhead visible in the image count the same as watermark text (see rule above) -- ignore them as document-type evidence, in the image just as much as in the text.
+- If the image's main subject is a PERSON holding up an ID card (a selfie/liveness-style photo), that's `not_for_underwriting`, not `identification` -- only a flat scan/photo of the document itself as the primary subject counts as identification.
+- A visually formal layout (envelope, letterhead) doesn't add evidence beyond what's already covered above for minimal-text documents -- looking official isn't the same as containing financial or medical content."""
 
 FINANCIAL_VISION_NOTE = GENERIC_VISION_NOTE
 
@@ -83,14 +80,14 @@ FINANCIAL_VISION_NOTE = GENERIC_VISION_NOTE
 ID_VISION_NOTE = GENERIC_VISION_NOTE + """
 
 ### Vision-specific guidance for identification classification
-- Passports have a very distinct visual layout: a booklet biodata page with a fixed photo position, a structured data block, and a printed MRZ band at the bottom. If the image shows this layout, trust it strongly -- even if the OCR text is sparse or a country name in the text seems to suggest a national ID card instead. A country name/code by itself only tells you the person's NATIONALITY, not the document TYPE -- it does not distinguish a passport from a national ID card. When passport-specific structural signals (MRZ artifacts, booklet biodata layout) are present, they win over an assumption based on country name alone."""
+- A passport's booklet biodata-page layout (fixed photo position, structured data block, printed MRZ band at the bottom) is a strong CONFIRMING visual signal for id_passport -- trust it even when OCR text is sparse, per the country-name-vs-document-type reminder above."""
 
 # --- Medical: fixes for checkbox-symptom-tables leaking into healthcheck, and patient
 # history documents needing an explicit clinical-narrative home.
 MEDICAL_VISION_NOTE = GENERIC_VISION_NOTE + """
 
 ### Vision-specific guidance for medical classification
-- A checkbox-style table or checklist of disease/symptom names (checked/unchecked, yes/no) is NOT sufficient for medical_healthcheck on its own -- that class requires genuine MEASURED vitals (an actual number for BP, weight, height, BMI, or heart rate). If the image shows only checkboxes/ticks against condition names with no such numeric vitals present, do not let the checkup-form-shaped visual layout alone push you toward medical_healthcheck -- classify by what's actually on the page per the priority order below."""
+- The checkbox/no-vitals exclusion above applies to what the image shows too -- a checkup-form-shaped layout with only checkboxes/ticks and no visible numeric values is still not medical_healthcheck."""
 
 MACRO_BASE = """You are a Document Macro Classifier for an insurance underwriting pipeline. Classify raw OCR/markdown text into exactly one of: `medical`, `financial`, `identification`, `not_for_underwriting`. Treat the patterns below as supporting evidence, not an exact-string checklist -- read holistically. Ignore PII.
 
@@ -108,7 +105,7 @@ Route here for genuine clinical content: clinical notes, lab metrics, health-che
   - CRITICAL OVERRIDE: If income ("รายได้") details are present, you MUST route to `financial`, even if the document looks like an insurance e-Form containing premium payment keywords ("ชำระเบี้ยประกัน") or company headers.
 - Receipts/Proof-of-payment: Including hospital/pharmacy/medical treatment receipts (ค่ายา, ค่ารักษา, ค่าห้อง), government permit fee receipts, retail receipts, or any other billing statement. All receipts are financial, regardless of what the payment was for.
 - General agreements/contracts: Lease, sale, or other business contracts.
-- NOT financial: a company logo, letterhead, or formal-looking layout alone, with no bank ledger, registration number, income declaration, receipt, or contract content actually present. Formal visual appearance is not itself financial evidence -- see the eForm Trap below.
+- NOT financial: a company logo, letterhead, or formal-looking layout alone -- see the rule above. Formal appearance isn't financial evidence; see the eForm Trap below for the common case this causes.
 
 ### 3. identification
 A genuine ID/travel/civil-registry document with its own native structure (not a field filled into someone else's form):
@@ -124,7 +121,7 @@ A genuine ID/travel/civil-registry document with its own native structure (not a
 ### 4. not_for_underwriting
 Default when nothing above applies. The underwriter will not use this document.
 - Insurance application/policy paperwork (eForm Trap): Forms containing applicant fields (เบี้ยประกัน, policy details), regardless of company letterhead, logos, or formal visual presentation. 
-  - SPECIFIC ANCHORS: A markdown title/heading resembling "บันทึกคำชี้แจ้ง/คำชี้แจง...เกี่ยวกับใบคำขอ(เอา)ประกันภัย" (a memo/note explaining details for an insurance application -- spelling varies), consent letters, OR documents containing "ชำระเบี้ยประกัน" (premium payment) mixed with a company name/address in the page header. These remain `not_for_underwriting` even when they carry an insurer's logo or letterhead -- that branding is expected on this document type and is not evidence it's financial.
+  - SPECIFIC ANCHORS: A markdown title/heading resembling "บันทึกคำชี้แจ้ง/คำชี้แจง...เกี่ยวกับใบคำขอ(เอา)ประกันภัย" (a memo/note explaining details for an insurance application -- spelling varies), consent letters, OR documents containing "ชำระเบี้ยประกัน" (premium payment) mixed with a company name/address in the page header -- letterhead/logo included, per the rule above.
   - EXCEPTION: If the document explicitly declares actual income details ("รายได้"), route to `financial` instead.
 - Litmus test for eForms: Strip out the applicant's name/ID/policy number, the letterhead, and the logo -- is any standalone financial, clinical, or identity statement left? If nothing remains but "applying for / updating a policy," it belongs here, no matter how formal it looks.
 - Correspondence: Letters/memos between the insured and underwriter requesting documents (administrative communication).
@@ -152,7 +149,7 @@ Reminder: insurance watermarks/disclaimers (+ date/time stamps) are never eviden
 
 Reminder: a country name/code (e.g. "LAO PDR", "Union of Myanmar") tells you the person's NATIONALITY, not the document TYPE. It does not by itself mean id_foreigner_nationalid rather than id_passport -- check for passport-specific structural signals (MRZ garbled artifact patterns like "<<<<", a booklet biodata-page layout, a passport number field) before deciding. When those are present, they win over a bare country-name association.
  
-- id_thainationalid / id_foreigner_nationalid: national demographic card headers and identity issuing text blocks. Foreign-script documents (e.g. a Lao national ID) still count even if largely unreadable by OCR -- look for legible fragments like issuing country name/code, name, or a DOB pattern. Do NOT use this class just because a country name appears in the text -- confirm it's a national ID card layout, not a passport (see id_passport) or a stateless ID (see id_statelessid).
+- id_thainationalid / id_foreigner_nationalid: national demographic card headers and identity issuing text blocks. Foreign-script documents (e.g. a Lao national ID) still count even if largely unreadable by OCR -- look for legible fragments like issuing country name/code, name, or a DOB pattern. Confirm it's a national ID card layout, not a passport or stateless ID -- country name alone isn't enough (see reminder above).
 - id_passport: the passport bio data page -- photo/data block, passport number, nationality, an MRZ line (letters/digits + long "<" runs, including garbled OCR fragments like "SACSDWsd<<<<" -- this pattern alone is a strong passport anchor even without a clean country name). If an image is available, a booklet biodata-page layout is a strong confirming signal.
 - id_visastamp: a Thai visa page and/or immigration control stamp -- visa category codes, "DEPARTED"/"ADMITTED"/"ENTRY" keywords, and (often garbled, since stamp text is curved) date-like digit strings near them. Does NOT include a Thai E-Visa (see id_thaievisa below).
 - id_thaievisa: a Thai Electronic Visa (E-Visa) -- look for the literal term "E-VISA" printed on the document; this alone is a reliable, standalone anchor for this class.
@@ -240,25 +237,44 @@ def get_field_confidence(logprobs, field_value: str) -> float:
     val_probs = [tokens[i].logprob for i in range(span_start, span_end + 1) if tokens[i].logprob is not None]
     return round(math.exp(sum(val_probs) / len(val_probs)) * 100, 2) if val_probs else 0.0
 
-def call_with_retry(fn, *args, **kwargs):
-    max_retries = 6
-    base_delay = 1.0
-    max_delay = 60.0
+def call_with_retry(fn, *args, max_retries: int = 6, base_delay: float = 1.0,
+                     max_delay: float = 60.0, **kwargs):
+    """CHANGED: the previous version slept the same flat delay on every RateLimitError
+    retry attempt (no exponential growth), which under sustained rate limiting just
+    re-hammers the endpoint every ~1s until max_retries gives up -- exactly the "lots
+    of max retries errors" pattern. Now backs off exponentially (with jitter, so
+    concurrent threads don't retry in lockstep) whenever the server doesn't tell us
+    exactly how long to wait via Retry-After."""
     for attempt in range(max_retries):
         try:
             return fn(*args, **kwargs)
         except RateLimitError as e:
-            retry_after = float(e.response.headers.get("retry-after", base_delay)) if e.response else base_delay
-            time.sleep(retry_after + random.uniform(0, 1))
+            retry_after = None
+            try:
+                retry_after = float(e.response.headers.get("retry-after")) if e.response else None
+            except (TypeError, ValueError):
+                retry_after = None
+            delay = retry_after if retry_after is not None else min(max_delay, base_delay * (2 ** attempt))
+            delay += random.uniform(0, delay * 0.25)
+            print(f"[RATE LIMIT] attempt {attempt + 1}/{max_retries}, sleeping {delay:.1f}s"
+                  f"{' (server Retry-After)' if retry_after is not None else ' (backoff)'}")
+            time.sleep(delay)
         except (APIConnectionError, APITimeoutError) as e:
-            time.sleep(min(max_delay, base_delay * (2 ** attempt)) + random.uniform(0, 1))
-    raise RuntimeError("Exceeded max retries for API call.")
+            delay = min(max_delay, base_delay * (2 ** attempt)) + random.uniform(0, 1)
+            print(f"[TRANSIENT ERROR] {type(e).__name__} -- attempt {attempt + 1}/{max_retries}, sleeping {delay:.1f}s")
+            time.sleep(delay)
+    raise RuntimeError(f"Exceeded max_retries ({max_retries}) calling {getattr(fn, '__name__', fn)}")
 
 def call_agent_multimodal(client, model, system_prompt, user_prompt, ocr_text, image_path, use_vision, schema, temperature=0.0, seed=42):
     user_content = [{"type": "text", "text": user_prompt.format(ocr_text=ocr_text)}]
-    encoded_img = encode_image(image_path)
-    if use_vision and encoded_img:
-        user_content.append({"type": "image_url", "image_url": {"url": encoded_img, "detail": "low"}})
+    # CHANGED: only touch disk / base64-encode when the image is actually going to be
+    # used. Previously this ran unconditionally, even on text-only calls -- 2 wasted
+    # disk reads + encodes per document (macro + specialist), across every worker
+    # thread, for no benefit at all when use_vision=False.
+    if use_vision:
+        encoded_img = encode_image(image_path)
+        if encoded_img:
+            user_content.append({"type": "image_url", "image_url": {"url": encoded_img, "detail": "low"}})
 
     start_time = time.time()
     response = call_with_retry(
