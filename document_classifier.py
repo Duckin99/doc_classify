@@ -61,17 +61,21 @@ def get_schema(use_cot: bool, schema_type: str):
 GENERIC_VISION_NOTE = """
 
 ### Joint Multimodal Rule (Text + Image Synthesis)
-You receive BOTH the OCR/markdown text and the raw document image -- the image is not just a fallback for missing text. Use it for: low-text visual artifacts OCR often garbles (foreign scripts, ECG waveforms, X-ray films), and stamps/seals/layouts that confirm document structure."""
+You receive BOTH the OCR/markdown text and the raw document image. Do not treat the image merely as a fallback.
+The visual structure is critical context for:
+1. Low-text visual artifacts (e.g., foreign scripts like Lao IDs where OCR scrambles text, or raw ECG waveforms/X-ray films).
+2. Official stamps, seals, or layouts that provide ground-truth document structure."""
 
-# --- Macro: fixes for eForm-vs-financial confusion, envelope/hospital-name-only docs,
-# and portrait-holding-ID misrouted to identification. All three were cases where the
-# model over-weighted visual formality (a logo, a formal layout) instead of content.
+# --- Macro: reverted MACRO_BASE back to the pre-insight-round wording (highest
+# measured macro accuracy, 96.81%), then added 3 new targeted fixes there instead of
+# stacking more rules on top of a version that had regressed. Kept only the
+# portrait-holding-ID vision fix here since it wasn't implicated in the regression and
+# isn't covered by the new text-level fixes; dropped the logo/formal-layout vision
+# bullets since that content no longer has a matching anchor in the reverted base.
 MACRO_VISION_NOTE = GENERIC_VISION_NOTE + """
 
 ### Vision-specific guidance for macro classification
-- Logos/letterhead visible in the image count the same as watermark text (see rule above) -- ignore them as document-type evidence, in the image just as much as in the text.
-- If the image's main subject is a PERSON holding up an ID card (a selfie/liveness-style photo), that's `not_for_underwriting`, not `identification` -- only a flat scan/photo of the document itself as the primary subject counts as identification.
-- A visually formal layout (envelope, letterhead) doesn't add evidence beyond what's already covered above for minimal-text documents -- looking official isn't the same as containing financial or medical content."""
+- If the image's main visible subject is a PERSON -- e.g. a selfie/portrait of someone holding up an ID card to the camera -- this is a portrait/liveness photo, not an identification document. Route to `not_for_underwriting`. A genuine identification document has the ID card/document itself as the flat, primary subject filling the frame, not a person holding it."""
 
 FINANCIAL_VISION_NOTE = GENERIC_VISION_NOTE
 
@@ -80,23 +84,23 @@ FINANCIAL_VISION_NOTE = GENERIC_VISION_NOTE
 ID_VISION_NOTE = GENERIC_VISION_NOTE + """
 
 ### Vision-specific guidance for identification classification
-- A passport's booklet biodata-page layout (fixed photo position, structured data block, printed MRZ band at the bottom) is a strong CONFIRMING visual signal for id_passport -- trust it even when OCR text is sparse, per the country-name-vs-document-type reminder above."""
+- Passports have a very distinct visual layout: a booklet biodata page with a fixed photo position, a structured data block, and a printed MRZ band at the bottom. If the image shows this layout, trust it strongly -- even if the OCR text is sparse or a country name in the text seems to suggest a national ID card instead. A country name/code by itself only tells you the person's NATIONALITY, not the document TYPE -- it does not distinguish a passport from a national ID card. When passport-specific structural signals (MRZ artifacts, booklet biodata layout) are present, they win over an assumption based on country name alone."""
 
 # --- Medical: fixes for checkbox-symptom-tables leaking into healthcheck, and patient
 # history documents needing an explicit clinical-narrative home.
 MEDICAL_VISION_NOTE = GENERIC_VISION_NOTE + """
 
 ### Vision-specific guidance for medical classification
-- The checkbox/no-vitals exclusion above applies to what the image shows too -- a checkup-form-shaped layout with only checkboxes/ticks and no visible numeric values is still not medical_healthcheck."""
+- A checkbox-style table or checklist of disease/symptom names (checked/unchecked, yes/no) is NOT sufficient for medical_healthcheck on its own -- that class requires genuine MEASURED vitals (an actual number for BP, weight, height, BMI, or heart rate). If the image shows only checkboxes/ticks against condition names with no such numeric vitals present, do not let the checkup-form-shaped visual layout alone push you toward medical_healthcheck -- classify by what's actually on the page per the priority order below."""
 
 MACRO_BASE = """You are a Document Macro Classifier for an insurance underwriting pipeline. Classify raw OCR/markdown text into exactly one of: `medical`, `financial`, `identification`, `not_for_underwriting`. Treat the patterns below as supporting evidence, not an exact-string checklist -- read holistically. Ignore PII.
 
-### Ignore Watermarks, Logos, and Letterheads
-Insurance disclaimers, company logos, and letterheads (+ date/time stamps) are never evidence of document type on their own -- ignore them completely. A document carrying an insurer's or hospital's branding is not automatically financial or medical because of that branding; classify by the document's actual content.
+### Ignore Watermarks
+Insurance disclaimers (+ date/time stamps) are never evidence of document type -- ignore them completely.
 
 ### 1. medical
 Route here for genuine clinical content: clinical notes, lab metrics, health-check parameters, prescriptions, test ranges, normal/abnormal flags. Garbled OCR with technical-looking terms next to numbers/units/ranges still counts as low-confidence medical (flag the uncertainty).
-- EXCLUSION: Do NOT route here for a hospital/pharmacy receipt or billing statement -- those are `financial` regardless of medical context. Do NOT route here for correspondence that merely discusses or requests medical information without containing the clinical data itself -- that is `not_for_underwriting`. A hospital name/letterhead alone, with no clinical data and no payment figures, is `not_for_underwriting`, not medical.
+- EXCLUSION: Do NOT route here for a hospital/pharmacy receipt or billing statement -- those are `financial` regardless of medical context. Do NOT route here for correspondence that merely discusses or requests medical information without containing the clinical data itself -- that is `not_for_underwriting`. This includes an envelope/mailing label that mentions what's being sent (e.g. "ส่งใบตรวจสุขภาพ" -- sending a health check report) but has no actual clinical data on the page itself -- still `not_for_underwriting`, not medical, regardless of the hospital name being present.
 
 ### 2. financial
 - Bank/account identity: Account number + bank name/branch, or a native transaction ledger (dated money movements, ideally a markdown table).
@@ -105,28 +109,28 @@ Route here for genuine clinical content: clinical notes, lab metrics, health-che
   - CRITICAL OVERRIDE: If income ("รายได้") details are present, you MUST route to `financial`, even if the document looks like an insurance e-Form containing premium payment keywords ("ชำระเบี้ยประกัน") or company headers.
 - Receipts/Proof-of-payment: Including hospital/pharmacy/medical treatment receipts (ค่ายา, ค่ารักษา, ค่าห้อง), government permit fee receipts, retail receipts, or any other billing statement. All receipts are financial, regardless of what the payment was for.
 - General agreements/contracts: Lease, sale, or other business contracts.
-- NOT financial: a company logo, letterhead, or formal-looking layout alone -- see the rule above. Formal appearance isn't financial evidence; see the eForm Trap below for the common case this causes.
+- NOT financial: a LETTER or memo requesting/claiming reimbursement for a fee -- e.g. "ขอเบิกค่าตรวจ" (requesting to claim an examination fee) -- is a request ABOUT a payment, not a financial record itself. Route to `not_for_underwriting` (Correspondence). Likewise, money figures describing an insurance policy's own terms (ทุนประกัน, เบี้ยประกัน) inside an application form are not a financial transaction record -- see the eForm Trap below.
 
 ### 3. identification
 A genuine ID/travel/civil-registry document with its own native structure (not a field filled into someone else's form):
-- National/Stateless ID: Issuing country name/code (e.g., "LAO PDR", "RDP LAO"), a genuine name+DOB or name+issue/expiry block. Look for "รับรองสำเนาถูกต้อง" (certified true copy) or `<figure>` tags wrapping personal-detail blocks. Stateless-ID text or garbled non-Thai script (e.g., Lao misread as Thai) combined with a country-code header also counts. NOTE: a country name/code tells you nationality, not document type -- it does not by itself distinguish a national ID from a passport; see Passports/Visas below for passport-specific signals.
-- Passports/Visas: MRZ lines (letters/digits + long "<" runs, e.g., "PA123<<<<<<<" or similar garbled artifact patterns), or immigration/visa keywords ("VISA", "VISACLASS", "IMMIGRATION", "DEPARTED", "ADMITTED", "ENTRY") near messy digits/dates. These structural signals indicate a passport specifically, and take priority over a bare country-name match.
+- National/Stateless ID: Issuing country name/code (e.g., "LAO PDR", "RDP LAO"), a genuine name+DOB or name+issue/expiry block. Look for "รับรองสำเนาถูกต้อง" (certified true copy) or `<figure>` tags wrapping personal-detail blocks. Stateless-ID text or garbled non-Thai script (e.g., Lao misread as Thai) combined with a country-code header also counts.
+- Passports/Visas: MRZ lines (letters/digits + long "<" runs, e.g., "PA123<<<<<<<"), or immigration/visa keywords ("VISA", "VISACLASS", "IMMIGRATION", "DEPARTED", "ADMITTED", "ENTRY") near messy digits/dates.
 - Thai E-Visa: The literal term "E-VISA" printed on the document is a strong, standalone anchor.
 - Tax Forms: FATCA-related tax forms (W-9, W-4, W-8BEN) or similar withholding declarations.
 - Work Permits: Labor authorization booklets, employer/employee details, type-of-work (ประเภทงาน), Department of Employment text. Includes renewals/amendments (รายการเปลี่ยนเพิ่มประเภทงาน).
 - Civil Registry: Household registration (ทะเบียนบ้าน), Marriage certificate (ใบสำคัญการสมรส / ทะเบียนสมรส), Birth certificate (สูติบัตร).
-- Other IDs: Student IDs, employee badges, or any physical identity card with a photo placeholder/ID number -- provided the ID DOCUMENT ITSELF is the primary subject (a flat scan/photo of the card), not a person holding it up (see not_for_underwriting).
+- Other IDs: Student IDs, employee badges, or any physical identity card with a photo placeholder/ID number.
 - Reminder: An ID document stamped with an insurance watermark/date is still `identification`.
 
 ### 4. not_for_underwriting
 Default when nothing above applies. The underwriter will not use this document.
-- Insurance application/policy paperwork (eForm Trap): Forms containing applicant fields (เบี้ยประกัน, policy details), regardless of company letterhead, logos, or formal visual presentation. 
-  - SPECIFIC ANCHORS: A markdown title/heading resembling "บันทึกคำชี้แจ้ง/คำชี้แจง...เกี่ยวกับใบคำขอ(เอา)ประกันภัย" (a memo/note explaining details for an insurance application -- spelling varies), consent letters, OR documents containing "ชำระเบี้ยประกัน" (premium payment) mixed with a company name/address in the page header -- letterhead/logo included, per the rule above.
+- Insurance application/policy paperwork (eForm Trap): Forms containing applicant fields (เบี้ยประกัน, policy details). 
+  - SPECIFIC ANCHORS: A title/heading matching the PATTERN "บันทึกคำชี้แจ้ง/คำชี้แจง...เกี่ยวกับใบคำขอ(เอา)ประกัน(ภัย)" -- a memo clarifying details for an insurance application. Wording and spelling vary -- e.g. "บันทึกคำชี้แจ้งเกี่ยวกับใบคำขอเอาประกัน", "บันทึกคำชี้แจงเกี่ยวกับใบคำขอประกันภัย" -- match the pattern, not one exact string. Also: consent letters, OR documents containing "ชำระเบี้ยประกัน" (premium payment) mixed with a company name/address in the PageHeader.
   - EXCEPTION: If the document explicitly declares actual income details ("รายได้"), route to `financial` instead.
-- Litmus test for eForms: Strip out the applicant's name/ID/policy number, the letterhead, and the logo -- is any standalone financial, clinical, or identity statement left? If nothing remains but "applying for / updating a policy," it belongs here, no matter how formal it looks.
-- Correspondence: Letters/memos between the insured and underwriter requesting documents (administrative communication).
-- Envelope/mailing metadata: Sender name, policy codes (e.g., "T1348646"), addressing text, or a hospital name with no accompanying medical record content -- these stay here even if the layout looks visually formal or official.
-- Photos/Noise: Portrait photos or ID placeholders without issuing text. This includes a selfie/portrait where a person is holding up an ID card to the camera (a liveness/KYC-style photo) -- the person, not the document, is the main subject, so this is not `identification`."""
+- Litmus test for eForms: Strip out the applicant's name/ID/policy number and any policy-term figures (ทุนประกัน, เบี้ยประกัน) -- is any standalone financial, clinical, or identity statement left? If nothing remains but "applying for / updating a policy," it belongs here.
+- Correspondence: Letters/memos between the insured and underwriter requesting documents, or requesting/claiming reimbursement for a fee (administrative communication, not a financial record).
+- Envelope/mailing metadata: Sender name, policy codes (e.g., "T1348646"), addressing text -- including when it references sending a medical or financial document without containing that document's actual content.
+- Photos/Noise: Portrait photos or ID placeholders without issuing text, or completely illegible noise."""
 
 AGENT1_USER_PROMPT = "Classify the following raw OCR text into medical, financial, identification, or not_for_underwriting:\n{ocr_text}"
 
@@ -149,7 +153,7 @@ Reminder: insurance watermarks/disclaimers (+ date/time stamps) are never eviden
 
 Reminder: a country name/code (e.g. "LAO PDR", "Union of Myanmar") tells you the person's NATIONALITY, not the document TYPE. It does not by itself mean id_foreigner_nationalid rather than id_passport -- check for passport-specific structural signals (MRZ garbled artifact patterns like "<<<<", a booklet biodata-page layout, a passport number field) before deciding. When those are present, they win over a bare country-name association.
  
-- id_thainationalid / id_foreigner_nationalid: national demographic card headers and identity issuing text blocks. Foreign-script documents (e.g. a Lao national ID) still count even if largely unreadable by OCR -- look for legible fragments like issuing country name/code, name, or a DOB pattern. Confirm it's a national ID card layout, not a passport or stateless ID -- country name alone isn't enough (see reminder above).
+- id_thainationalid / id_foreigner_nationalid: national demographic card headers and identity issuing text blocks. Foreign-script documents (e.g. a Lao national ID) still count even if largely unreadable by OCR -- look for legible fragments like issuing country name/code, name, or a DOB pattern. Do NOT use this class just because a country name appears in the text -- confirm it's a national ID card layout, not a passport (see id_passport) or a stateless ID (see id_statelessid).
 - id_passport: the passport bio data page -- photo/data block, passport number, nationality, an MRZ line (letters/digits + long "<" runs, including garbled OCR fragments like "SACSDWsd<<<<" -- this pattern alone is a strong passport anchor even without a clean country name). If an image is available, a booklet biodata-page layout is a strong confirming signal.
 - id_visastamp: a Thai visa page and/or immigration control stamp -- visa category codes, "DEPARTED"/"ADMITTED"/"ENTRY" keywords, and (often garbled, since stamp text is curved) date-like digit strings near them. Does NOT include a Thai E-Visa (see id_thaievisa below).
 - id_thaievisa: a Thai Electronic Visa (E-Visa) -- look for the literal term "E-VISA" printed on the document; this alone is a reliable, standalone anchor for this class.
