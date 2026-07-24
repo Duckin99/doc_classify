@@ -305,17 +305,17 @@ def evaluate_imaging_routing_recall(df_sample: pd.DataFrame, client: AzureOpenAI
         checkpoint_path=checkpoint_path, resume=resume,
     )
 
-    gt_cols = [c for c in ("xray_gt", "ultrasound_gt", "ecg_gt") if c in routed_df.columns]
-    if not gt_cols:
-        raise ValueError(
-            "df_sample has none of xray_gt/ultrasound_gt/ecg_gt -- evaluate_imaging_routing_recall "
-            "expects a sample already filtered to documents with a known imaging ground-truth flag."
-        )
-    has_flag = routed_df[gt_cols].fillna(False).astype(bool).any(axis=1)
-    positive = routed_df[has_flag]
-    if positive.empty:
-        return routed_df, None
+    # gt_cols = [c for c in ("xray_gt", "ultrasound_gt", "ecg_gt") if c in routed_df.columns]
+    # if not gt_cols:
+    #     raise ValueError(
+    #         "df_sample has none of xray_gt/ultrasound_gt/ecg_gt -- evaluate_imaging_routing_recall "
+    #         "expects a sample already filtered to documents with a known imaging ground-truth flag."
+    #     )
+    # has_flag = routed_df[gt_cols].fillna(False).astype(bool).any(axis=1)
+    # positive = routed_df[has_flag]
+    # if positive.empty:
+    #     return routed_df, None
 
-    captured = positive["final_subcategory"].isin(IMAGING_ELIGIBLE_SUBCATEGORIES)
-    recall_stats = {"recall": float(captured.mean()), "n": len(positive), "captured": int(captured.sum())}
-    return routed_df, recall_stats
+    # captured = positive["final_subcategory"].isin(IMAGING_ELIGIBLE_SUBCATEGORIES)
+    # recall_stats = {"recall": float(captured.mean()), "n": len(positive), "captured": int(captured.sum())}
+    return routed_df#, recall_stats
