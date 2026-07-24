@@ -52,9 +52,11 @@ from plotly.subplots import make_subplots
 
 MULTILABEL_TAGS = ("xray", "ultrasound", "ecg")
 DOMAIN_ORDER = ["medical", "financial", "identification", "not_for_underwriting"]
-DOMAIN_PREFIX_MAP = {"medical": "medical", "financial": "financial", "id": "identification"}
+SPECIALIST_DOMAINS = ["medical", "financial", "identification"]  # domains with a specialist stage
 
-BLUE, PURPLE, GREEN, RED = "#2563eb", "#7c3aed", "#059669", "#dc2626"
+BLUE, PURPLE, GREEN = "#2563eb", "#7c3aed", "#059669"
+# ColorBrewer "Blues" tints, same family as the confusion-matrix heatmap colorscale.
+BLUES_DARK, BLUES_MID, BLUES_LIGHT, BLUES_PALE = "#08306b", "#2171b5", "#4292c6", "#9ecae1"
 
 
 # ---------------------------------------------------------------------------
@@ -63,15 +65,6 @@ BLUE, PURPLE, GREEN, RED = "#2563eb", "#7c3aed", "#059669", "#dc2626"
 
 def esc(s):
     return htmlmod.escape("" if s is None else str(s))
-
-
-def infer_domain(subcat):
-    if not isinstance(subcat, str) or not subcat:
-        return "unknown"
-    if subcat == "not_for_underwriting":
-        return "not_for_underwriting"
-    prefix = subcat.split("_", 1)[0]
-    return DOMAIN_PREFIX_MAP.get(prefix, prefix)
 
 
 def ordered_labels(labels):
@@ -126,18 +119,33 @@ def macro_avg(metrics, key):
     return sum(m[key] for m in metrics) / len(metrics) if metrics else 0.0
 
 
-def domain_specialist_accuracy(df):
-    if "ground_truth" not in df or "final_subcategory" not in df:
+def specialist_breakdown(df):
+    """Per-domain specialist performance, isolated from macro-stage routing errors.
+
+    Restricts to rows where macro_decision == macro_gt (the macro stage routed
+    to the correct domain), then measures final_subcategory vs ground_truth
+    within each domain. Misrouted documents are excluded rather than counted
+    as specialist misses -- a document sent to the wrong specialist was never
+    going to get the right subclass label regardless of that specialist's
+    quality, so including it would blend stage-1 and stage-2 error together.
+    """
+    needed = {"macro_gt", "macro_decision", "ground_truth", "final_subcategory"}
+    if not needed.issubset(df.columns):
         return {}
-    sub = df[["ground_truth", "final_subcategory"]].dropna()
+    sub = df[list(needed)].dropna()
     if sub.empty:
         return {}
-    sub = sub.copy()
-    sub["domain"] = sub["ground_truth"].apply(infer_domain)
+    routed = sub[sub["macro_decision"] == sub["macro_gt"]]
     out = {}
-    for domain, g in sub.groupby("domain"):
-        correct = (g["ground_truth"] == g["final_subcategory"]).sum()
-        out[domain] = {"accuracy": correct / len(g), "n": len(g)}
+    for domain, g in routed.groupby("macro_gt"):
+        correct = int((g["ground_truth"] == g["final_subcategory"]).sum())
+        cm, labels, n = build_confusion(g, "ground_truth", "final_subcategory")
+        out[domain] = {
+            "accuracy": correct / len(g) if len(g) else 0.0,
+            "n": len(g),
+            "cm": cm, "labels": labels,
+            "class_metrics": class_metrics_from_cm(cm, labels) if cm is not None else [],
+        }
     return out
 
 
@@ -209,7 +217,7 @@ def pipeline_summary(df):
             "accuracy": accuracy_from_cm(e2e_cm) if e2e_cm is not None else 0.0,
             "class_metrics": e2e_class_m,
             "macro_f1": macro_avg(e2e_class_m, "f1"),
-            "by_domain": domain_specialist_accuracy(df),
+            "by_domain": specialist_breakdown(df),
         },
         "lt": lt,
         "lt_means": {
@@ -242,11 +250,11 @@ def confusion_heatmap_fig(cm, labels, true_name, pred_name):
 def metrics_bar_fig(metrics):
     dfm = pd.DataFrame(metrics)
     fig = go.Figure(data=[
-        go.Bar(name="Precision", x=dfm["label"], y=dfm["precision"], marker_color=BLUE,
+        go.Bar(name="Precision", x=dfm["label"], y=dfm["precision"], marker_color=BLUES_DARK,
                text=dfm["precision"], texttemplate="%{text:.0%}", textposition="outside"),
-        go.Bar(name="Recall", x=dfm["label"], y=dfm["recall"], marker_color=PURPLE,
+        go.Bar(name="Recall", x=dfm["label"], y=dfm["recall"], marker_color=BLUES_MID,
                text=dfm["recall"], texttemplate="%{text:.0%}", textposition="outside"),
-        go.Bar(name="F1", x=dfm["label"], y=dfm["f1"], marker_color=GREEN,
+        go.Bar(name="F1", x=dfm["label"], y=dfm["f1"], marker_color=BLUES_LIGHT,
                text=dfm["f1"], texttemplate="%{text:.0%}", textposition="outside"),
     ])
     fig.update_layout(
@@ -309,7 +317,12 @@ def small_cm_fig(m):
         z=z, x=["Pred: False", "Pred: True"], y=["GT: False", "GT: True"],
         colorscale="Blues", showscale=False, text=z, texttemplate="%{text}",
     ))
-    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=260, yaxis=dict(autorange="reversed"),
+    # Fixed pixel size (not responsive) -- these sit in a wrapping flex grid, and
+    # letting Plotly auto-size to its container is what caused the overlap: the
+    # container's width isn't settled yet at the moment this script tag runs, so
+    # Plotly falls back to its ~700px default canvas and spills into neighbors.
+    fig.update_layout(width=320, height=280, margin=dict(l=10, r=10, t=10, b=10),
+                       yaxis=dict(autorange="reversed"),
                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
     return fig
 
@@ -317,13 +330,13 @@ def small_cm_fig(m):
 def multilabel_bar_fig(per_tag):
     tags = list(per_tag.keys())
     fig = go.Figure(data=[
-        go.Bar(name="Accuracy", x=[t.upper() for t in tags], y=[per_tag[t]["accuracy"] for t in tags], marker_color=RED,
+        go.Bar(name="Accuracy", x=[t.upper() for t in tags], y=[per_tag[t]["accuracy"] for t in tags], marker_color=BLUES_DARK,
                text=[per_tag[t]["accuracy"] for t in tags], texttemplate="%{text:.0%}", textposition="outside"),
-        go.Bar(name="Precision", x=[t.upper() for t in tags], y=[per_tag[t]["precision"] for t in tags], marker_color=BLUE,
+        go.Bar(name="Precision", x=[t.upper() for t in tags], y=[per_tag[t]["precision"] for t in tags], marker_color=BLUES_MID,
                text=[per_tag[t]["precision"] for t in tags], texttemplate="%{text:.0%}", textposition="outside"),
-        go.Bar(name="Recall", x=[t.upper() for t in tags], y=[per_tag[t]["recall"] for t in tags], marker_color=PURPLE,
+        go.Bar(name="Recall", x=[t.upper() for t in tags], y=[per_tag[t]["recall"] for t in tags], marker_color=BLUES_LIGHT,
                text=[per_tag[t]["recall"] for t in tags], texttemplate="%{text:.0%}", textposition="outside"),
-        go.Bar(name="F1", x=[t.upper() for t in tags], y=[per_tag[t]["f1"] for t in tags], marker_color=GREEN,
+        go.Bar(name="F1", x=[t.upper() for t in tags], y=[per_tag[t]["f1"] for t in tags], marker_color=BLUES_PALE,
                text=[per_tag[t]["f1"] for t in tags], texttemplate="%{text:.0%}", textposition="outside"),
     ])
     fig.update_layout(
@@ -399,6 +412,28 @@ def metrics_table_html(metrics):
     </div>"""
 
 
+def specialist_confusion_section_html(by_domain, div_prefix):
+    domains = [d for d in ordered_labels(by_domain.keys()) if d in SPECIALIST_DOMAINS]
+    if not domains:
+        return ""
+    blocks = []
+    for domain in domains:
+        d = by_domain[domain]
+        if d["cm"] is None:
+            blocks.append(f"<h4>{esc(domain.title())} specialist</h4><p class='muted'>No correctly-routed rows for this domain.</p>")
+            continue
+        blocks.append(f"""
+        <h4>{esc(domain.title())} specialist &mdash; {d['accuracy']:.1%} accuracy (n={d['n']})</h4>
+        {fig_to_div(confusion_heatmap_fig(d['cm'], d['labels'], 'ground_truth', 'final_subcategory'), f"{div_prefix}_spec_{domain}")}
+        {metrics_table_html(d['class_metrics'])}
+        """)
+    return f"""
+    <h3>Per-specialist confusion matrices</h3>
+    <p class="muted">Restricted to documents the macro stage routed to the correct domain, so each matrix reflects that specialist's own subclass accuracy in isolation from routing errors.</p>
+    {''.join(blocks)}
+    """
+
+
 def multilabel_section_html(ml, div_prefix):
     if not ml:
         return ""
@@ -458,7 +493,10 @@ def run_section_html(label, summary, ml, div_prefix):
       {fig_to_div(metrics_bar_fig(e2e['class_metrics']), f"{div_prefix}_e2e_bar") if e2e['class_metrics'] else ''}
 
       <h3>Specialist accuracy by domain</h3>
+      <p class="muted">Restricted to documents the macro stage routed to the correct domain -- isolates specialist performance from macro routing errors.</p>
       {domain_fig_html}
+
+      {specialist_confusion_section_html(e2e['by_domain'], div_prefix)}
 
       <h3>Latency &amp; token distribution</h3>
       {fig_to_div(latency_box_fig(summary['lt']), f"{div_prefix}_lat_box")}
@@ -519,7 +557,7 @@ th, td { padding: 0.45rem 0.65rem; text-align: center; border-bottom: 1px solid 
 th { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; color: #6b7280; }
 td:first-child, th:first-child { text-align: left; }
 .cm-grid { display: flex; flex-wrap: wrap; gap: 1.2rem; }
-.cm-small { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 0.8rem; min-width: 260px; flex: 1 1 260px; }
+.cm-small { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 0.8rem; flex: 0 0 auto; }
 .cm-small h4 { margin: 0 0 0.5rem; font-size: 0.85rem; }
 .muted { color: #6b7280; font-size: 0.85rem; }
 footer { max-width: 1100px; margin: 3rem auto 0; padding: 0 1.5rem; color: #9ca3af; font-size: 0.78rem; }
