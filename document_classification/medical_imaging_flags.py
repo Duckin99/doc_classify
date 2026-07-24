@@ -305,17 +305,29 @@ def evaluate_imaging_routing_recall(df_sample: pd.DataFrame, client: AzureOpenAI
         checkpoint_path=checkpoint_path, resume=resume,
     )
 
-    # gt_cols = [c for c in ("xray_gt", "ultrasound_gt", "ecg_gt") if c in routed_df.columns]
-    # if not gt_cols:
-    #     raise ValueError(
-    #         "df_sample has none of xray_gt/ultrasound_gt/ecg_gt -- evaluate_imaging_routing_recall "
-    #         "expects a sample already filtered to documents with a known imaging ground-truth flag."
-    #     )
-    # has_flag = routed_df[gt_cols].fillna(False).astype(bool).any(axis=1)
-    # positive = routed_df[has_flag]
-    # if positive.empty:
-    #     return routed_df, None
+    gt_cols = [c for c in ("xray_gt", "ultrasound_gt", "ecg_gt") if c in routed_df.columns]
+    if gt_cols:
+        # Ground-truth flag columns survived onto the cascade output -- use them to
+        # find the imaging-positive subset explicitly.
+        has_flag = routed_df[gt_cols].fillna(False).astype(bool).any(axis=1)
+        positive = routed_df[has_flag]
+    else:
+        # run_cascade_batch_checkpointed (document_classifier.py) only writes its own
+        # result columns plus filepath/ocr_text to the checkpoint -- every other input
+        # column, including xray_gt/ultrasound_gt/ecg_gt, is dropped. So there's no
+        # ground-truth column left here to filter on. This falls back to treating all
+        # of df_sample as imaging-positive, which is only correct if df_sample was
+        # already curated to have zero negatives before calling this function. If that
+        # assumption doesn't hold, recall will be inflated by non-imaging documents
+        # that happen to land in an eligible subclass anyway (medical_clinical in
+        # particular is a broad catch-all in document_classifier.py's prompt).
+        print("[NOTE] xray_gt/ultrasound_gt/ecg_gt not found on cascade output -- "
+              "treating all of df_sample as imaging-positive.")
+        positive = routed_df
 
-    # captured = positive["final_subcategory"].isin(IMAGING_ELIGIBLE_SUBCATEGORIES)
-    # recall_stats = {"recall": float(captured.mean()), "n": len(positive), "captured": int(captured.sum())}
-    return routed_df#, recall_stats
+    if positive.empty:
+        return routed_df, None
+
+    captured = positive["final_subcategory"].isin(IMAGING_ELIGIBLE_SUBCATEGORIES)
+    recall_stats = {"recall": float(captured.mean()), "n": len(positive), "captured": int(captured.sum())}
+    return routed_df, recall_stats

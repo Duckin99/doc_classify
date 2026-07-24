@@ -228,17 +228,24 @@ def imaging_routing_recall(df):
     imaging-tagging accuracy number -- expects the output of
     medical_imaging_flags.evaluate_imaging_routing_recall(), not the regular
     --results or --flags CSVs.
+    Falls back to treating every row as imaging-positive if no xray_gt/
+    ultrasound_gt/ecg_gt column is present -- run_cascade_batch_checkpointed
+    (document_classifier.py) drops those from its output, so this is the normal
+    case for evaluate_imaging_routing_recall()'s CSV, not an edge case. Only
+    correct if the sample was pre-curated to have zero negatives; see
+    evaluate_imaging_routing_recall()'s docstring in medical_imaging_flags.py.
     """
     if df is None or "final_subcategory" not in df.columns:
-        return None
-    gt_cols = [c for c in ("xray_gt", "ultrasound_gt", "ecg_gt") if c in df.columns]
-    if not gt_cols:
         return None
     sub = df.dropna(subset=["final_subcategory"])
     if sub.empty:
         return None
-    has_flag = sub[gt_cols].fillna(False).astype(bool).any(axis=1)
-    positive = sub[has_flag]
+    gt_cols = [c for c in ("xray_gt", "ultrasound_gt", "ecg_gt") if c in sub.columns]
+    if gt_cols:
+        has_flag = sub[gt_cols].fillna(False).astype(bool).any(axis=1)
+        positive = sub[has_flag]
+    else:
+        positive = sub
     if positive.empty:
         return None
     captured = positive["final_subcategory"].isin(IMAGING_ELIGIBLE_SUBCATEGORIES)
