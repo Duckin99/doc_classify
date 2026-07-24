@@ -23,6 +23,8 @@ Usage
         --results results_multimodal.csv --run-label Multimodal \\
         --compare-results results_text_only.csv --compare-label "Text-only" \\
         --flags flags_multimodal.csv --compare-flags flags_text_only.csv \\
+        --imaging-routing imaging_routing_recall_multimodal.csv \\
+        --compare-imaging-routing imaging_routing_recall_text_only.csv \\
         --output report.html
 
 Expected columns
@@ -32,10 +34,18 @@ Expected columns
     (optional) macro_latency_sec, macro_tokens_in, macro_tokens_out,
                specialist_latency_sec, specialist_tokens_in, specialist_tokens_out
 
---flags (output of `medical_imaging_flags.py`):
+--flags (output of `medical_imaging_flags.py`'s run_imaging_flags_batch):
     xray_gt, ultrasound_gt, ecg_gt,
     contains_xray, contains_ultrasound, contains_ecg
     (optional) latency_sec, tokens_in, tokens_out
+
+--imaging-routing (output of `medical_imaging_flags.py`'s
+evaluate_imaging_routing_recall(), only meaningful in --compare-results mode):
+    final_subcategory, and at least one of xray_gt/ultrasound_gt/ecg_gt
+    Renders one bar chart in the Head-to-Head Comparison section: of documents that
+    truly have an imaging finding, what fraction the cascade routed somewhere
+    medical_imaging_flags.py would actually run on it. Different question from
+    --flags (which measures the imaging tagger's own precision/recall).
 
 Missing optional columns degrade gracefully (that chart/row is just skipped).
 """
@@ -187,6 +197,35 @@ def multilabel_metrics(df, tags=MULTILABEL_TAGS):
         for _, row in sub.iterrows()
     ) if len(sub) else 0
     return {"per_tag": per_tag, "exact_match_ratio": exact / len(sub) if len(sub) else 0.0, "n": len(sub)}
+
+
+IMAGING_ELIGIBLE_SUBCATEGORIES = {"medical_clinical", "medical_healthcheck", "medical_lab"}
+
+
+def imaging_routing_recall(df):
+    """Of documents that truly have at least one imaging finding (xray_gt /
+    ultrasound_gt / ecg_gt), what fraction did the macro+specialist cascade route
+    into a subclass medical_imaging_flags.py actually runs against
+    (IMAGING_ELIGIBLE_SUBCATEGORIES)? A misrouted imaging-positive document never
+    reaches the imaging tagger at all, so this is upstream routing recall, not an
+    imaging-tagging accuracy number -- expects the output of
+    medical_imaging_flags.evaluate_imaging_routing_recall(), not the regular
+    --results or --flags CSVs.
+    """
+    if df is None or "final_subcategory" not in df.columns:
+        return None
+    gt_cols = [c for c in ("xray_gt", "ultrasound_gt", "ecg_gt") if c in df.columns]
+    if not gt_cols:
+        return None
+    sub = df.dropna(subset=["final_subcategory"])
+    if sub.empty:
+        return None
+    has_flag = sub[gt_cols].fillna(False).astype(bool).any(axis=1)
+    positive = sub[has_flag]
+    if positive.empty:
+        return None
+    captured = positive["final_subcategory"].isin(IMAGING_ELIGIBLE_SUBCATEGORIES)
+    return {"recall": float(captured.mean()), "n": len(positive), "captured": int(captured.sum())}
 
 
 def latency_token_frame(df):
@@ -395,6 +434,23 @@ def comparison_specialist_fig(label_a, summary_a, label_b, summary_b):
     return fig
 
 
+def imaging_routing_recall_fig(label_a, recall_a, label_b, recall_b):
+    fig = go.Figure(go.Bar(
+        x=[label_a, label_b], y=[recall_a["recall"], recall_b["recall"]],
+        marker_color=[CMP_A, CMP_B],
+        text=[f"{recall_a['recall']:.1%} ({recall_a['captured']}/{recall_a['n']})",
+              f"{recall_b['recall']:.1%} ({recall_b['captured']}/{recall_b['n']})"],
+        textposition="outside",
+    ))
+    fig.update_layout(
+        yaxis_tickformat=".0%", yaxis_range=[0, 1.18], showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=10, r=10, t=20, b=10), height=360,
+    )
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(120,130,145,0.18)")
+    return fig
+
+
 def comparison_latency_token_fig(label_a, summary_a, label_b, summary_b):
     fig = make_subplots(rows=1, cols=3, subplot_titles=("Avg e2e latency (s)", "Avg e2e tokens in", "Avg e2e tokens out"))
     m_a, m_b = summary_a["lt_means"], summary_b["lt_means"]
@@ -535,7 +591,14 @@ def run_section_html(label, summary, ml, div_prefix):
     """
 
 
-def comparison_section_html(label_a, summary_a, label_b, summary_b):
+def comparison_section_html(label_a, summary_a, label_b, summary_b, recall_a=None, recall_b=None):
+    imaging_recall_html = ""
+    if recall_a and recall_b:
+        imaging_recall_html = f"""
+      <h3>Imaging routing recall</h3>
+      <p class="muted">Of documents that truly contain an X-ray/ultrasound/ECG finding, the share the macro+specialist cascade routed into a subclass medical_imaging_flags.py actually runs against (medical_clinical/medical_healthcheck/medical_lab). A misrouted imaging-positive document never reaches the imaging tagger at all -- this is upstream routing recall, not imaging-tagging accuracy.</p>
+      {fig_to_div(imaging_routing_recall_fig(label_a, recall_a, label_b, recall_b), "cmp_ir")}
+        """
     return f"""
     <section>
       <h2>Head-to-Head Comparison</h2>
@@ -543,6 +606,7 @@ def comparison_section_html(label_a, summary_a, label_b, summary_b):
       <h3>Specialist accuracy by domain</h3>
       <p class="muted">Restricted to documents the macro stage routed to the correct domain -- isolates specialist performance from macro routing errors.</p>
       {fig_to_div(comparison_specialist_fig(label_a, summary_a, label_b, summary_b), "cmp_spec")}
+      {imaging_recall_html}
       <h3>Latency &amp; tokens</h3>
       {fig_to_div(comparison_latency_token_fig(label_a, summary_a, label_b, summary_b), "cmp_lt")}
     </section>
@@ -631,9 +695,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--results", required=True, help="Main results CSV (document_classifier.py output)")
     ap.add_argument("--flags", help="Multi-label imaging flags CSV (medical_imaging_flags.py output)")
+    ap.add_argument("--imaging-routing", help="Output of medical_imaging_flags.evaluate_imaging_routing_recall() for the primary run")
     ap.add_argument("--run-label", default="Run", help="Label for the primary run (used in headings / comparison table)")
     ap.add_argument("--compare-results", help="Optional second results CSV to compare against --results")
     ap.add_argument("--compare-flags", help="Optional second flags CSV to pair with --compare-results")
+    ap.add_argument("--compare-imaging-routing", help="Output of evaluate_imaging_routing_recall() for the comparison run")
     ap.add_argument("--compare-label", default="Comparison Run", help="Label for the comparison run")
     ap.add_argument("--title", default="Document Classification -- Evaluation Report", help="Report <title> / heading")
     ap.add_argument("--output", default="classification_report.html", help="Output HTML file path")
@@ -641,8 +707,10 @@ def main():
 
     df_a = pd.read_csv(args.results)
     flags_a = pd.read_csv(args.flags) if args.flags else None
+    ir_a = pd.read_csv(args.imaging_routing) if args.imaging_routing else None
     summary_a = pipeline_summary(df_a)
     ml_a = multilabel_metrics(flags_a) if flags_a is not None else None
+    recall_a = imaging_routing_recall(ir_a) if ir_a is not None else None
 
     sections = [run_section_html(args.run_label, summary_a, ml_a, "a")]
     note = f"{len(df_a)} documents ({args.run_label})"
@@ -650,9 +718,11 @@ def main():
     if args.compare_results:
         df_b = pd.read_csv(args.compare_results)
         flags_b = pd.read_csv(args.compare_flags) if args.compare_flags else None
+        ir_b = pd.read_csv(args.compare_imaging_routing) if args.compare_imaging_routing else None
         summary_b = pipeline_summary(df_b)
         ml_b = multilabel_metrics(flags_b) if flags_b is not None else None
-        sections.insert(0, comparison_section_html(args.run_label, summary_a, args.compare_label, summary_b))
+        recall_b = imaging_routing_recall(ir_b) if ir_b is not None else None
+        sections.insert(0, comparison_section_html(args.run_label, summary_a, args.compare_label, summary_b, recall_a, recall_b))
         sections.append(run_section_html(args.compare_label, summary_b, ml_b, "b"))
         note += f" vs {len(df_b)} documents ({args.compare_label})"
 

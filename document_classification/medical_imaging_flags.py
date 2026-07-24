@@ -27,7 +27,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, create_model
 from openai import AzureOpenAI, BadRequestError
 
-from document_classifier import call_with_retry
+from document_classifier import call_with_retry, run_cascade_batch_checkpointed
 
 # ==========================================
 # 1. CORE PROMPT DEFINITIONS
@@ -256,3 +256,66 @@ def run_imaging_flags_batch(df: pd.DataFrame, client: AzureOpenAI, text_col="ocr
 
     results_df = pd.DataFrame(results).set_index("_idx")
     return df.join(results_df)
+
+
+# ==========================================
+# 5. IMAGING ROUTING RECALL (upstream cascade coverage check)
+# ==========================================
+# run_imaging_flags_batch (above) only ever runs on documents the macro+specialist
+# cascade already routed into one of these three subclasses -- medical_others and
+# every non-medical domain are never passed to the imaging tagger at all. So a
+# document that genuinely contains an X-ray/ultrasound/ECG finding but gets
+# misrouted upstream (wrong domain, or dumped in medical_others) never reaches the
+# imaging tagger to begin with -- that's a miss the flags model itself can't see or
+# be blamed for. evaluate_imaging_routing_recall measures exactly that upstream gap.
+IMAGING_ELIGIBLE_SUBCATEGORIES = {"medical_clinical", "medical_healthcheck", "medical_lab"}
+
+
+def evaluate_imaging_routing_recall(df_sample: pd.DataFrame, client: AzureOpenAI,
+                                     text_col="ocr_text", img_col="filepath",
+                                     macro_model: str = "gpt-54mini-swe-d-clab-model01",
+                                     specialist_model: str = "gpt-54mini-swe-d-clab-model01",
+                                     use_vision: bool = False, use_cot: bool = True,
+                                     max_workers: int = 5,
+                                     checkpoint_path: str = "imaging_routing_recall.csv",
+                                     resume: bool = True):
+    """Runs df_sample -- documents already known to have at least one true imaging
+    flag (xray_gt / ultrasound_gt / ecg_gt) -- through the full document_classifier.py
+    macro->specialist cascade, then reports what fraction land in one of
+    IMAGING_ELIGIBLE_SUBCATEGORIES (i.e. would actually reach the imaging tagger).
+
+    This is a recall metric ("of documents that truly have imaging content, how many
+    does the pipeline funnel somewhere the imaging tagger can see them"), not an
+    imaging-tagging accuracy metric -- it never looks at contains_xray/etc. at all.
+
+    Reuses run_cascade_batch_checkpointed directly rather than reimplementing the
+    cascade, so it gets the same retry/error-handling/checkpoint-resume behavior as
+    every other cascade run. checkpoint_path defaults to a name distinct from your
+    main results CSV -- pass your own to avoid colliding with an unrelated run.
+
+    Returns (routed_df, recall_stats) where routed_df is df_sample with the cascade's
+    output columns (macro_decision, final_subcategory, etc.) joined on, and
+    recall_stats is {"recall": float, "n": int, "captured": int} -- or None if
+    df_sample has no rows with a true imaging flag.
+    """
+    routed_df = run_cascade_batch_checkpointed(
+        df_sample, client, text_col=text_col, img_col=img_col,
+        macro_model=macro_model, specialist_model=specialist_model,
+        use_vision=use_vision, use_cot=use_cot, max_workers=max_workers,
+        checkpoint_path=checkpoint_path, resume=resume,
+    )
+
+    gt_cols = [c for c in ("xray_gt", "ultrasound_gt", "ecg_gt") if c in routed_df.columns]
+    if not gt_cols:
+        raise ValueError(
+            "df_sample has none of xray_gt/ultrasound_gt/ecg_gt -- evaluate_imaging_routing_recall "
+            "expects a sample already filtered to documents with a known imaging ground-truth flag."
+        )
+    has_flag = routed_df[gt_cols].fillna(False).astype(bool).any(axis=1)
+    positive = routed_df[has_flag]
+    if positive.empty:
+        return routed_df, None
+
+    captured = positive["final_subcategory"].isin(IMAGING_ELIGIBLE_SUBCATEGORIES)
+    recall_stats = {"recall": float(captured.mean()), "n": len(positive), "captured": int(captured.sum())}
+    return routed_df, recall_stats
