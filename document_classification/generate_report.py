@@ -56,7 +56,9 @@ SPECIALIST_DOMAINS = ["medical", "financial", "identification"]  # domains with 
 
 BLUE, PURPLE, GREEN = "#2563eb", "#7c3aed", "#059669"
 # ColorBrewer "Blues" tints, same family as the confusion-matrix heatmap colorscale.
+# Every bar chart in the report draws from this palette so it reads as one system.
 BLUES_DARK, BLUES_MID, BLUES_LIGHT, BLUES_PALE = "#08306b", "#2171b5", "#4292c6", "#9ecae1"
+CMP_A, CMP_B = BLUES_DARK, BLUES_LIGHT  # two-run comparison charts: primary run vs. comparison run
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +140,8 @@ def specialist_breakdown(df):
     routed = sub[sub["macro_decision"] == sub["macro_gt"]]
     out = {}
     for domain, g in routed.groupby("macro_gt"):
+        if domain not in SPECIALIST_DOMAINS:
+            continue  # not_for_underwriting is terminal at macro -- no specialist, no subclass to score
         correct = int((g["ground_truth"] == g["final_subcategory"]).sum())
         cm, labels, n = build_confusion(g, "ground_truth", "final_subcategory")
         out[domain] = {
@@ -272,7 +276,7 @@ def domain_accuracy_fig(by_domain):
     accs = [by_domain[d]["accuracy"] for d in domains]
     ns = [by_domain[d]["n"] for d in domains]
     fig = go.Figure(go.Bar(
-        x=domains, y=accs, marker_color=BLUE, text=[f"{a:.1%} (n={n})" for a, n in zip(accs, ns)],
+        x=domains, y=accs, marker_color=BLUES_MID, text=[f"{a:.1%} (n={n})" for a, n in zip(accs, ns)],
         textposition="outside",
     ))
     fig.update_layout(
@@ -354,8 +358,32 @@ def comparison_bar_fig(label_a, summary_a, label_b, summary_b):
     vals_a = [summary_a["macro"]["accuracy"], summary_a["e2e"]["accuracy"]]
     vals_b = [summary_b["macro"]["accuracy"], summary_b["e2e"]["accuracy"]]
     fig = go.Figure(data=[
-        go.Bar(name=label_a, x=metrics, y=vals_a, marker_color=BLUE, text=vals_a, texttemplate="%{text:.1%}", textposition="outside"),
-        go.Bar(name=label_b, x=metrics, y=vals_b, marker_color="#94a3b8", text=vals_b, texttemplate="%{text:.1%}", textposition="outside"),
+        go.Bar(name=label_a, x=metrics, y=vals_a, marker_color=CMP_A, text=vals_a, texttemplate="%{text:.1%}", textposition="outside"),
+        go.Bar(name=label_b, x=metrics, y=vals_b, marker_color=CMP_B, text=vals_b, texttemplate="%{text:.1%}", textposition="outside"),
+    ])
+    fig.update_layout(
+        barmode="group", yaxis_tickformat=".0%", yaxis_range=[0, 1.18],
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=10, r=10, t=40, b=10), height=380,
+    )
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(120,130,145,0.18)")
+    return fig
+
+
+def comparison_specialist_fig(label_a, summary_a, label_b, summary_b):
+    """One grouped bar chart, per-specialist accuracy (medical/financial/identification),
+    run A vs run B -- restricted to correctly-routed documents, same definition as
+    the single-run 'Specialist accuracy by domain' chart."""
+    domains = [d for d in SPECIALIST_DOMAINS
+               if d in summary_a["e2e"]["by_domain"] or d in summary_b["e2e"]["by_domain"]]
+    vals_a = [summary_a["e2e"]["by_domain"].get(d, {}).get("accuracy", 0.0) for d in domains]
+    vals_b = [summary_b["e2e"]["by_domain"].get(d, {}).get("accuracy", 0.0) for d in domains]
+    fig = go.Figure(data=[
+        go.Bar(name=label_a, x=[d.title() for d in domains], y=vals_a, marker_color=CMP_A,
+               text=vals_a, texttemplate="%{text:.1%}", textposition="outside"),
+        go.Bar(name=label_b, x=[d.title() for d in domains], y=vals_b, marker_color=CMP_B,
+               text=vals_b, texttemplate="%{text:.1%}", textposition="outside"),
     ])
     fig.update_layout(
         barmode="group", yaxis_tickformat=".0%", yaxis_range=[0, 1.18],
@@ -375,7 +403,7 @@ def comparison_latency_token_fig(label_a, summary_a, label_b, summary_b):
     ]
     for key, col in pairs:
         fig.add_trace(go.Bar(x=[label_a, label_b], y=[m_a[key], m_b[key]],
-                              marker_color=[BLUE, "#94a3b8"], showlegend=False,
+                              marker_color=[CMP_A, CMP_B], showlegend=False,
                               text=[f"{m_a[key]:.2f}", f"{m_b[key]:.2f}"], textposition="outside"),
                       row=1, col=col)
     fig.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
@@ -512,6 +540,10 @@ def comparison_section_html(label_a, summary_a, label_b, summary_b):
     <section>
       <h2>Head-to-Head Comparison</h2>
       {fig_to_div(comparison_bar_fig(label_a, summary_a, label_b, summary_b), "cmp_acc")}
+      <h3>Specialist accuracy by domain</h3>
+      <p class="muted">Restricted to documents the macro stage routed to the correct domain -- isolates specialist performance from macro routing errors.</p>
+      {fig_to_div(comparison_specialist_fig(label_a, summary_a, label_b, summary_b), "cmp_spec")}
+      <h3>Latency &amp; tokens</h3>
       {fig_to_div(comparison_latency_token_fig(label_a, summary_a, label_b, summary_b), "cmp_lt")}
     </section>
     """

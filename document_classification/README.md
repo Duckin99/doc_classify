@@ -5,7 +5,7 @@ Multi-agent LLM pipeline that triages raw underwriting document scans into
 to a specialist agent for a granular subcategory, and independently tags
 medical documents for X-Ray / Ultrasound / ECG content.
 
-**Deployment:** `gpt-54mini-swe-d-clab-model01` &nbsp;|&nbsp; **Last evaluated:** 23 Jul 2026 &nbsp;|&nbsp; **Sample size:** 1,127 documents
+**Deployment:** `gpt-54mini-swe-d-clab-model01` &nbsp;|&nbsp; **Last evaluated:** 23 Jul 2026 &nbsp;|&nbsp; **Sample size:** ~1,120 documents
 
 ---
 
