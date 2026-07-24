@@ -82,7 +82,7 @@ document_classification/
 | File | Type | Purpose |
 |---|---|---|
 | [`document_classifier.py`](document_classifier.py) | library | Runs the macro → specialist cascade over a DataFrame, checkpointing results to CSV as it goes |
-| [`medical_imaging_flags.py`](medical_imaging_flags.py) | library | Runs the independent multi-label imaging tagger over medical documents |
+| [`medical_imaging_flags.py`](medical_imaging_flags.py) | library | Runs the independent multi-label imaging tagger over medical documents, plus a routing-recall check that reuses `document_classifier.py`'s cascade |
 | [`review.py`](review.py) | Streamlit app | Interactive macro/specialist confusion matrix + per-sample drill-down (needs the repo + a running Streamlit server) |
 | [`flag_review.py`](flag_review.py) | Streamlit app | Interactive multi-label (X-Ray/Ultrasound/ECG) review + per-sample drill-down |
 | [`generate_report.py`](generate_report.py) | CLI script | Turns run CSVs into one offline, shareable `.html` report — for people who can't access the repo or run Streamlit |
@@ -120,7 +120,12 @@ Reruns with the same `checkpoint_path` resume — already-processed rows (by
 
 ### 2. Tag medical imaging findings — `medical_imaging_flags.py`
 
-Run on the medical-domain subset of a `document_classifier.py` result.
+Run on the medical-domain subset of a `document_classifier.py` result. Failed
+rows (rate limits exhausted, Azure content-filter blocks, etc.) fall back to a
+complete row with real `False`/`0` values rather than leaving gaps that
+`.astype(bool)` would silently turn into `True` downstream. Pass
+`checkpoint_path` for the same incremental-write-and-resume behavior as
+`document_classifier.py` — omit it to keep the old in-memory-only behavior.
 
 ```python
 from medical_imaging_flags import run_imaging_flags_batch
@@ -128,8 +133,30 @@ from medical_imaging_flags import run_imaging_flags_batch
 medical_rows = df_image[df_image["macro_decision"] == "medical"]
 flags_df = run_imaging_flags_batch(
     medical_rows, client, text_col="ocr_text", img_col="filepath", use_vision=True,
+    checkpoint_path="flags_multimodal.csv",
 )
-flags_df.to_csv("flags_multimodal.csv", index=False)
+```
+
+**Imaging routing recall.** `medical_imaging_flags.py` only ever runs on
+documents the cascade already routed into `medical_clinical` /
+`medical_healthcheck` / `medical_lab` — a document with a real imaging finding
+that got misrouted upstream (wrong domain, or `medical_others`) never reaches
+the imaging tagger at all. `evaluate_imaging_routing_recall` measures that gap:
+given a sample already known to have at least one true imaging flag, it runs
+the sample through the full macro→specialist cascade (via
+`document_classifier.run_cascade_batch_checkpointed`) and reports what
+fraction landed somewhere the imaging tagger would actually see them.
+
+```python
+from medical_imaging_flags import evaluate_imaging_routing_recall
+
+# df_sample: documents already known to have >=1 true xray_gt/ultrasound_gt/ecg_gt flag
+routed_mm, recall_mm = evaluate_imaging_routing_recall(
+    df_sample, client, use_vision=True, checkpoint_path="imaging_routing_multimodal.csv",
+)
+routed_text, recall_text = evaluate_imaging_routing_recall(
+    df_sample, client, use_vision=False, checkpoint_path="imaging_routing_textonly.csv",
+)
 ```
 
 ### 3. Interactive review dashboards — `review.py` / `flag_review.py`
@@ -149,6 +176,11 @@ pip install pandas plotly
 python3 generate_report.py --results results_multimodal.csv --flags flags_multimodal.csv --output report.html
 ```
 
+Add `--imaging-routing imaging_routing_multimodal.csv` (output of
+`evaluate_imaging_routing_recall`, see above) to include the imaging routing
+recall chart — only rendered in comparison mode, alongside
+`--compare-imaging-routing` for the second run.
+
 See [Generating the full report](#generating-the-full-report) below for the
 comparison mode used to produce the table at the top of this README.
 
@@ -167,19 +199,23 @@ python3 generate_report.py \
   --results results_multimodal.csv --run-label Multimodal \
   --compare-results results_text_only.csv --compare-label "Text-only" \
   --flags flags_multimodal.csv --compare-flags flags_text_only.csv \
+  --imaging-routing imaging_routing_multimodal.csv \
+  --compare-imaging-routing imaging_routing_textonly.csv \
   --title "Document Classification -- Evaluation Report" \
   --output classification_report.html
 ```
 
 The output is a single `.html` file (Plotly is bundled inline, no CDN or
 internet access needed to view it) — safe to email or drop in a shared drive
-for people who don't have repo access. It includes:
+for people who don't have repo access. Every bar chart draws from the same
+Blues palette as the confusion-matrix heatmaps, so the report reads as one
+visual system. It includes:
 
 - **Stage 1 — Macro triage**: confusion matrix + per-domain precision/recall/F1 (`macro_gt` vs `macro_decision`)
-- **Stage 2 — End-to-end subcategory**: confusion matrix + per-class metrics (`ground_truth` vs `final_subcategory`), plus accuracy broken down by domain
+- **Stage 2 — End-to-end subcategory**: confusion matrix + per-class metrics (`ground_truth` vs `final_subcategory`), plus specialist accuracy and a confusion matrix *per domain* (medical/financial/identification), restricted to documents the macro stage routed correctly — isolates specialist performance from macro routing errors, and excludes `not_for_underwriting` (no specialist stage, nothing to score)
 - **Stage 3 — Multi-label imaging** *(if `--flags` given)*: exact match ratio, per-modality precision/recall/F1/accuracy, 2×2 confusion matrices for X-Ray/Ultrasound/ECG
 - **Latency & token distributions** per stage (box plots + mean/median/P95)
-- **Head-to-head comparison** *(if `--compare-results` given)*: the two runs side by side, same shape as the table at the top of this README
+- **Head-to-head comparison** *(if `--compare-results` given)*: macro/e2e accuracy, per-specialist accuracy, latency/tokens, and — if `--imaging-routing`/`--compare-imaging-routing` are given — imaging routing recall, all two runs side by side
 
 Required columns are documented in the `generate_report.py` module docstring;
 missing optional columns (e.g. no token/latency logging) just skip that chart
