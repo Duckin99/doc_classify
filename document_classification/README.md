@@ -215,7 +215,7 @@ visual system. It includes:
 - **Stage 2 — End-to-end subcategory**: confusion matrix + per-class metrics (`ground_truth` vs `final_subcategory`), plus specialist accuracy and a confusion matrix *per domain* (medical/financial/identification), restricted to documents the macro stage routed correctly — isolates specialist performance from macro routing errors, and excludes `not_for_underwriting` (no specialist stage, nothing to score)
 - **Stage 3 — Multi-label imaging** *(if `--flags` given)*: exact match ratio, per-modality precision/recall/F1/accuracy, 2×2 confusion matrices for X-Ray/Ultrasound/ECG
 - **Latency & token distributions** per stage (box plots + mean/median/P95)
-- **Head-to-head comparison** *(if `--compare-results` given)*: macro/e2e accuracy, per-specialist accuracy, latency/tokens, and — if `--imaging-routing`/`--compare-imaging-routing` are given — imaging routing recall, all two runs side by side
+- **Head-to-head comparison** *(if `--compare-results` given)*: macro/e2e accuracy, per-specialist accuracy, and cascade latency/tokens, all two runs side by side. If `--flags`/`--compare-flags` are given, also the imaging tagger's own per-modality accuracy and its latency/tokens (separate from the cascade's). If `--imaging-routing`/`--compare-imaging-routing` are given, also imaging routing recall.
 
 Required columns are documented in the `generate_report.py` module docstring;
 missing optional columns (e.g. no token/latency logging) just skip that chart

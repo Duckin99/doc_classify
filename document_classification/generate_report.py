@@ -199,6 +199,23 @@ def multilabel_metrics(df, tags=MULTILABEL_TAGS):
     return {"per_tag": per_tag, "exact_match_ratio": exact / len(sub) if len(sub) else 0.0, "n": len(sub)}
 
 
+def imaging_latency_token_means(df):
+    """Mean latency_sec / tokens_in / tokens_out from a medical_imaging_flags.py
+    --flags CSV -- the imaging tagger's own per-call cost, separate from the
+    macro+specialist cascade's latency/tokens tracked in pipeline_summary()."""
+    if df is None:
+        return None
+    cols = [c for c in ("latency_sec", "tokens_in", "tokens_out") if c in df.columns]
+    if not cols:
+        return None
+    means = {c: pd.to_numeric(df[c], errors="coerce").mean() for c in cols}
+    return {
+        "latency_sec": means.get("latency_sec", 0.0) or 0.0,
+        "tokens_in": means.get("tokens_in", 0.0) or 0.0,
+        "tokens_out": means.get("tokens_out", 0.0) or 0.0,
+    }
+
+
 IMAGING_ELIGIBLE_SUBCATEGORIES = {"medical_clinical", "medical_healthcheck", "medical_lab"}
 
 
@@ -434,6 +451,42 @@ def comparison_specialist_fig(label_a, summary_a, label_b, summary_b):
     return fig
 
 
+def imaging_accuracy_fig(label_a, ml_a, label_b, ml_b):
+    """Grouped bar chart, per-modality (X-Ray/Ultrasound/ECG) imaging-tagging
+    accuracy, run A vs run B -- the imaging tagger's own accuracy, not the
+    upstream routing-recall metric in imaging_routing_recall_fig."""
+    tags = [t for t in MULTILABEL_TAGS if t in ml_a["per_tag"] or t in ml_b["per_tag"]]
+    vals_a = [ml_a["per_tag"].get(t, {}).get("accuracy", 0.0) for t in tags]
+    vals_b = [ml_b["per_tag"].get(t, {}).get("accuracy", 0.0) for t in tags]
+    fig = go.Figure(data=[
+        go.Bar(name=label_a, x=[t.upper() for t in tags], y=vals_a, marker_color=CMP_A,
+               text=vals_a, texttemplate="%{text:.1%}", textposition="outside"),
+        go.Bar(name=label_b, x=[t.upper() for t in tags], y=vals_b, marker_color=CMP_B,
+               text=vals_b, texttemplate="%{text:.1%}", textposition="outside"),
+    ])
+    fig.update_layout(
+        barmode="group", yaxis_tickformat=".0%", yaxis_range=[0, 1.18],
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=10, r=10, t=40, b=10), height=380,
+    )
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(120,130,145,0.18)")
+    return fig
+
+
+def imaging_latency_token_fig(label_a, means_a, label_b, means_b):
+    fig = make_subplots(rows=1, cols=3, subplot_titles=("Avg latency (s)", "Avg tokens in", "Avg tokens out"))
+    pairs = [("latency_sec", 1), ("tokens_in", 2), ("tokens_out", 3)]
+    for key, col in pairs:
+        fig.add_trace(go.Bar(x=[label_a, label_b], y=[means_a[key], means_b[key]],
+                              marker_color=[CMP_A, CMP_B], showlegend=False,
+                              text=[f"{means_a[key]:.2f}", f"{means_b[key]:.2f}"], textposition="outside"),
+                      row=1, col=col)
+    fig.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                       margin=dict(l=10, r=10, t=40, b=10), height=340)
+    return fig
+
+
 def imaging_routing_recall_fig(label_a, recall_a, label_b, recall_b):
     fig = go.Figure(go.Bar(
         x=[label_a, label_b], y=[recall_a["recall"], recall_b["recall"]],
@@ -591,10 +644,24 @@ def run_section_html(label, summary, ml, div_prefix):
     """
 
 
-def comparison_section_html(label_a, summary_a, label_b, summary_b, recall_a=None, recall_b=None):
-    imaging_recall_html = ""
+def comparison_section_html(label_a, summary_a, label_b, summary_b,
+                             recall_a=None, recall_b=None,
+                             ml_a=None, ml_b=None,
+                             imaging_lt_a=None, imaging_lt_b=None):
+    imaging_html = ""
+    if ml_a and ml_b:
+        imaging_html += f"""
+      <h3>Imaging tagging accuracy (X-Ray / Ultrasound / ECG)</h3>
+      <p class="muted">The imaging tagger's own per-modality accuracy -- distinct from imaging routing recall below, which measures whether an imaging-positive document even reaches the tagger.</p>
+      {fig_to_div(imaging_accuracy_fig(label_a, ml_a, label_b, ml_b), "cmp_ml_acc")}
+        """
+    if imaging_lt_a and imaging_lt_b:
+        imaging_html += f"""
+      <h3>Imaging tagging latency &amp; tokens</h3>
+      {fig_to_div(imaging_latency_token_fig(label_a, imaging_lt_a, label_b, imaging_lt_b), "cmp_ml_lt")}
+        """
     if recall_a and recall_b:
-        imaging_recall_html = f"""
+        imaging_html += f"""
       <h3>Imaging routing recall</h3>
       <p class="muted">Of documents that truly contain an X-ray/ultrasound/ECG finding, the share the macro+specialist cascade routed into a subclass medical_imaging_flags.py actually runs against (medical_clinical/medical_healthcheck/medical_lab). A misrouted imaging-positive document never reaches the imaging tagger at all -- this is upstream routing recall, not imaging-tagging accuracy.</p>
       {fig_to_div(imaging_routing_recall_fig(label_a, recall_a, label_b, recall_b), "cmp_ir")}
@@ -606,8 +673,8 @@ def comparison_section_html(label_a, summary_a, label_b, summary_b, recall_a=Non
       <h3>Specialist accuracy by domain</h3>
       <p class="muted">Restricted to documents the macro stage routed to the correct domain -- isolates specialist performance from macro routing errors.</p>
       {fig_to_div(comparison_specialist_fig(label_a, summary_a, label_b, summary_b), "cmp_spec")}
-      {imaging_recall_html}
-      <h3>Latency &amp; tokens</h3>
+      {imaging_html}
+      <h3>Latency &amp; tokens (macro + specialist cascade)</h3>
       {fig_to_div(comparison_latency_token_fig(label_a, summary_a, label_b, summary_b), "cmp_lt")}
     </section>
     """
@@ -710,6 +777,7 @@ def main():
     ir_a = pd.read_csv(args.imaging_routing) if args.imaging_routing else None
     summary_a = pipeline_summary(df_a)
     ml_a = multilabel_metrics(flags_a) if flags_a is not None else None
+    imaging_lt_a = imaging_latency_token_means(flags_a) if flags_a is not None else None
     recall_a = imaging_routing_recall(ir_a) if ir_a is not None else None
 
     sections = [run_section_html(args.run_label, summary_a, ml_a, "a")]
@@ -721,8 +789,14 @@ def main():
         ir_b = pd.read_csv(args.compare_imaging_routing) if args.compare_imaging_routing else None
         summary_b = pipeline_summary(df_b)
         ml_b = multilabel_metrics(flags_b) if flags_b is not None else None
+        imaging_lt_b = imaging_latency_token_means(flags_b) if flags_b is not None else None
         recall_b = imaging_routing_recall(ir_b) if ir_b is not None else None
-        sections.insert(0, comparison_section_html(args.run_label, summary_a, args.compare_label, summary_b, recall_a, recall_b))
+        sections.insert(0, comparison_section_html(
+            args.run_label, summary_a, args.compare_label, summary_b,
+            recall_a=recall_a, recall_b=recall_b,
+            ml_a=ml_a, ml_b=ml_b,
+            imaging_lt_a=imaging_lt_a, imaging_lt_b=imaging_lt_b,
+        ))
         sections.append(run_section_html(args.compare_label, summary_b, ml_b, "b"))
         note += f" vs {len(df_b)} documents ({args.compare_label})"
 
